@@ -68,7 +68,7 @@ public final class ConnectionBanner implements HudElement {
 		} else if (link.synced()) {
 			dot = fs != null && fs.auth() == AuthStatus.FAILED ? "error" : fs != null && fs.auth() == AuthStatus.CHECKING ? "thinking" : "working";
 			title = "Foreman · " + backendLabel(fs);
-			if (fs != null && fs.backend() == BackendName.CLAUDE && fs.account() != null) {
+			if (fs != null && fs.backend() != BackendName.SIM && fs.account() != null) {
 				detail = fs.account();
 			}
 			if (now - link.sinceMs() > FADE_AFTER_MS) {
@@ -132,8 +132,8 @@ public final class ConnectionBanner implements HudElement {
 	}
 
 	private static void drawAuthBanner(GuiGraphicsExtractor g, Font font, ForemanStatus fs) {
-		String head = "Claude backend can't authenticate";
-		String msg = fs.message() != null ? fs.message() : "run `claude` and /login, then restart the Foreman";
+		String head = backendLabel(fs) + " backend can't authenticate";
+		String msg = fs.message() != null ? fs.message() : "Check the selected provider's credentials, then restart the Foreman";
 		int maxW = Math.min(360, g.guiWidth() - 40);
 		var lines = TextUtil.wrap(font, msg, maxW - 34);
 		Kit.Padding p = Kit.padding("panel_paper");

@@ -25,6 +25,7 @@ export interface BusMessage {
 }
 
 export interface SessionRecord {
+  provider?: import('./protocol.js').BackendName;
   sessionId?: string;
   model?: string;
   turns: number;
@@ -57,6 +58,7 @@ export interface StateData {
   sessions: Record<string, SessionRecord>;
   worktreeMeta: Record<string, WorktreeMeta>; // key: `${repoId}/${worktreeId}`
   permissionRules: Record<string, string[]>; // agentId -> rule keys always allowed
+  teamPermissionRules: Record<string, string[]>; // repoId -> rule keys approved for this team
   /** opaque backend-owned state (e.g. sim progress) */
   backend: Record<string, unknown>;
 }
@@ -104,6 +106,7 @@ function emptyState(now: number): StateData {
     sessions: {},
     worktreeMeta: {},
     permissionRules: {},
+    teamPermissionRules: {},
     backend: {},
   };
 }
