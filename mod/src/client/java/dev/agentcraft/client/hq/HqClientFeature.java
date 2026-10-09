@@ -10,6 +10,7 @@ import dev.agentcraft.block.entity.StatusLampBlockEntity;
 import dev.agentcraft.client.dev.DevBridge;
 import dev.agentcraft.client.foreman.Foreman;
 import dev.agentcraft.client.foreman.ForemanState;
+import dev.agentcraft.client.ui.Guard;
 import dev.agentcraft.client.ui.UiStyle;
 import dev.agentcraft.layout.Anchors;
 import java.util.ArrayList;
@@ -48,10 +49,10 @@ public final class HqClientFeature {
 
 	public static void init() {
 		BlockEntityRenderers.register(ModBlockEntities.STATUS_LAMP, ctx -> new StatusLampRenderer());
-		ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+		ClientTickEvents.END_CLIENT_TICK.register(mc -> Guard.run("hq.tick", () -> {
 			HqWorldDriver.tick(mc);
 			ambience(mc);
-		});
+		}));
 		DevBridge.addStateContributor((mc, state) -> state.add("hq", stateJson()));
 		HqCheck.register();
 	}

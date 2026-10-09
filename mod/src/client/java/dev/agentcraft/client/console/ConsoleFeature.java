@@ -9,6 +9,7 @@ import dev.agentcraft.client.dev.DevBridge;
 import dev.agentcraft.client.dev.Fields;
 import dev.agentcraft.client.foreman.Foreman;
 import dev.agentcraft.client.hud.Keys;
+import dev.agentcraft.client.ui.Guard;
 import java.util.Map;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
@@ -37,7 +38,7 @@ public final class ConsoleFeature {
 		Keys.ensureRegistered();
 		DevBridge.registerScreen("console", mc -> ConsoleScreen.forDev(null));
 		dev.agentcraft.client.world.StationInteractions.onUse(ModBlocks.CONSOLE_TERMINAL, (player, pos, state, be) -> open(null, false));
-		ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+		ClientTickEvents.END_CLIENT_TICK.register(mc -> Guard.run("console.tick", () -> {
 			if (mc.player == null) {
 				return;
 			}
@@ -51,7 +52,7 @@ public final class ConsoleFeature {
 					open(null, false);
 				}
 			}
-		});
+		}));
 		registerDev();
 	}
 

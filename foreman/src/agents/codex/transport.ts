@@ -88,8 +88,12 @@ export class AppServerTransport {
       const params = (message.params ?? {}) as RpcObject;
       if (id === undefined) { this.onNotification(message.method, params); return; }
       // Server and client request IDs occupy independent namespaces.
-      try { this.send({ id, result: this.onRequest(message.method, params) }); }
-      catch (error) { this.send({ id, error: { code: error instanceof RpcError ? error.code : -32603, message: (error as Error).message } }); }
+      const reject = (error: unknown) => this.send({ id, error: { code: error instanceof RpcError ? error.code : -32603, message: (error as Error).message } });
+      try {
+        const result = this.onRequest(message.method, params);
+        if (result instanceof Promise) void result.then(value => this.send({ id, result: value }), reject);
+        else this.send({ id, result });
+      } catch (error) { reject(error); }
       return;
     }
     if (id === undefined || ('result' in message) === ('error' in message)) throw new Error('invalid response');

@@ -53,7 +53,7 @@ export class ClaudeRuntime implements AgentRuntime {
     const options: Options = {
       cwd: r.cwd, model: r.model, effort: r.effort, maxTurns: r.maxTurns,
       settingSources: [], permissionMode: 'default', canUseTool: r.canUseTool,
-      tools: r.role === 'lead' ? ['Read', 'Grep', 'Glob'] : ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash', 'TodoWrite'],
+      tools: r.role === 'lead' ? ['Read', 'Grep', 'Glob', 'Bash'] : ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash', 'TodoWrite'],
       disallowedTools: ['Bash(git push:*)', 'Task', 'Agent', 'WebSearch', 'WebFetch'],
       mcpServers: { [MCP_SERVER]: createSdkMcpServer({ name: MCP_SERVER, version: '0.1.0', tools: r.tools, alwaysLoad: true, instructions: `AgentCraft team tools: coordinate with teammates, ask ${userName()}, keep memory and the task board up to date.` }) },
       systemPrompt: { type: 'preset', preset: 'claude_code', append: r.systemPrompt },
@@ -74,10 +74,15 @@ export class ClaudeRuntime implements AgentRuntime {
     const signal = r.abortController.signal;
     if (signal.aborted) close();
     else signal.addEventListener('abort', close, { once: true });
+    let model: string | undefined;
     try {
       for await (const msg of q) {
         if (signal.aborted) break;
         mapper.handle(msg);
+        if (mapper.model && mapper.model !== model) {
+          model = mapper.model;
+          r.onModel?.(model);
+        }
         if (mapper.stats.sessionId) r.onSession(mapper.stats.sessionId);
       }
       return mapper.stats;

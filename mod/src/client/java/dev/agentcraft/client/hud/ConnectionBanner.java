@@ -20,7 +20,7 @@ import net.minecraft.util.Util;
 
 /**
  * Small Foreman status pill in the top-right corner, and a loud banner at the top centre when the
- * claude backend cannot authenticate.
+ * selected backend cannot authenticate.
  * <ul>
  *   <li>connected: quiet ink pill, teal dot, "Foreman · sim" (or the claude account); fades to a
  *       lower opacity after a few seconds;</li>
@@ -98,6 +98,7 @@ public final class ConnectionBanner implements HudElement {
 		return switch (fs.backend()) {
 			case SIM -> fs.speed() != null && fs.speed() != 1.0 ? "sim ×" + trim(fs.speed()) : "sim";
 			case CLAUDE -> "claude";
+			case CODEX -> "codex";
 			default -> fs.backend().wire();
 		};
 	}
@@ -132,7 +133,12 @@ public final class ConnectionBanner implements HudElement {
 	}
 
 	private static void drawAuthBanner(GuiGraphicsExtractor g, Font font, ForemanStatus fs) {
-		String head = backendLabel(fs) + " backend can't authenticate";
+		String head = switch (fs.backend()) {
+			case CODEX -> "Codex backend can't authenticate";
+			case CLAUDE -> "Claude backend can't authenticate";
+			case OPENAI -> "OpenAI backend can't authenticate";
+			default -> "Agent backend can't authenticate";
+		};
 		String msg = fs.message() != null ? fs.message() : "Check the selected provider's credentials, then restart the Foreman";
 		int maxW = Math.min(360, g.guiWidth() - 40);
 		var lines = TextUtil.wrap(font, msg, maxW - 34);

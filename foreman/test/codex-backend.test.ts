@@ -1,14 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { CodexBackend, CodexRuntime, codexArgs, threadConfig, type CodexSpawn } from '../src/agents/codex/index.js';
 import { startBridge } from '../src/agents/codex/bridge.js';
 import { demoRepo, makeForeman, tempDir, rmrf, until, type Harness } from './helpers.js';
 import { turnRequest } from './provider-helpers.js';
+import { createTeam } from '../src/agents/teams.js';
 import { TeamPermissions } from '../src/permissions.js';
 import { buildTeamTools } from '../src/agents/tools.js';
 
@@ -39,6 +41,115 @@ describe('Codex app-server integration', () => {
     expect(args.join(' ')).not.toContain('PRIVATE PROMPT');
     expect(args.join(' ')).not.toContain('127.0.0.1');
     expect(args.join(' ')).not.toContain('dangerously-bypass');
+  });
+
+  it('reports the configured model and turn token usage without counting duplicate events', async () => {
+    setup();
+    const models: string[] = [];
+    const stats = await new CodexRuntime(h.cfg.codex, fakeSpawn).run(turnRequest(h, dir, {
+      prompt: '[metadata]', model: '', onModel: model => models.push(model),
+    }));
+    expect(models).toEqual(['gpt-configured']);
+    expect(stats).toMatchObject({ isError: false, tokens: 300 });
+    expect(h.fm.store.logTail('kit').some(entry => entry.text.includes('tokens'))).toBe(true);
+  });
+
+  it('uses the production team factory without overriding each turn’s configured model or effort', async () => {
+    setup();
+    const launcher = path.join(dir, process.platform === 'win32' ? 'codex-test-launcher.cmd' : 'codex-test-launcher');
+    fs.writeFileSync(launcher, process.platform === 'win32'
+      ? `@"${process.execPath}" "${fixture}" %*\r\n`
+      : `#!${process.execPath}\nimport(${JSON.stringify(pathToFileURL(fixture).href)});\n`, { mode: 0o755 });
+    const cfg = { ...h.cfg, codex: { ...h.cfg.codex, command: launcher, workerModel: 'default', effort: undefined } };
+    const engine = createTeam(h.fm, cfg).engineFor('kit');
+    const models: string[] = [];
+    const trace = path.join(dir, 'factory-trace.jsonl');
+    for (const model of ['repo-A-model', 'repo-B-model']) {
+      const abort = new AbortController();
+      const result = await engine.runTurn({
+        agentId: 'kit', role: 'worker', cwd: dir, prompt: '[metadata]', instructions: 'Test the adapter.',
+        env: { ...process.env, AGENTCRAFT_TEST_TRACE: trace, AGENTCRAFT_TEST_MODEL: model },
+        abort, turn: { signal: abort.signal, reason: () => undefined }, tools: [],
+        permission: async () => ({ allow: true }), onProcess() {}, onSession() {}, onModel: value => models.push(value),
+      });
+      expect(result).toMatchObject({ isError: false, tokens: 300 });
+    }
+    expect(models).toEqual(['repo-A-model', 'repo-B-model']);
+    const requests = fs.readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const starts = requests.filter(request => request.method === 'thread/start');
+    expect(starts).toHaveLength(2);
+    for (const start of starts) {
+      expect(start.params.model).toBeUndefined();
+      expect(start.params.config.model_reasoning_effort).toBeUndefined();
+      expect(start.params.config.mcp_servers.agentcraft.bearer_token_env_var).toBe('AGENTCRAFT_MCP_TOKEN');
+    }
+    for (const turn of requests.filter(request => request.method === 'turn/start')) expect(turn.params.effort).toBeUndefined();
+  });
+
+  it('accepts a configured provider that does not require an OpenAI login', async () => {
+    setup();
+    const key = process.env.CODEX_API_KEY;
+    delete process.env.CODEX_API_KEY;
+    const localSpawn: CodexSpawn = (_command, args, opts) => spawn(process.execPath, [fixture, ...args], {
+      ...opts, env: { ...opts.env, AGENTCRAFT_TEST_NO_OPENAI_AUTH: '1' },
+    });
+    try { expect(await new CodexRuntime(h.cfg.codex, localSpawn).checkAuth()).toBe('Codex configured provider'); }
+    finally { if (key !== undefined) process.env.CODEX_API_KEY = key; }
+  });
+
+  it.each([
+    ['', 'legacy-thread', 1], ['[foreign]', 'legacy-thread', 0], ['[stale]', 'legacy-thread', 0],
+    ['[unknown]', 'legacy-thread', 0], ['[bad-args]', 'legacy-thread', 0], ['', undefined, 0],
+  ] as const)('validates legacy team aliases against the active role, thread and turn (%s, resume=%s)', async (suffix, resume, expectedCalls) => {
+    setup();
+    let calls = 0;
+    const request = turnRequest(h, dir, { resume, prompt: `[legacy-tool] ${suffix}`, tools: [{
+      name: 'legacy_probe', description: 'Current role team handler', inputSchema: { value: z.string() },
+      handler: async () => { calls++; return { content: [{ type: 'text', text: 'current handler' }] }; },
+    }] });
+    const stats = await new CodexRuntime(h.cfg.codex, fakeSpawn).run(request);
+    expect(stats.errors).toEqual([]);
+    expect(calls).toBe(expectedCalls);
+    expect(JSON.parse(stats.resultText!).success).toBe(expectedCalls === 1);
+  });
+
+  it('aborts and drains an outstanding legacy alias before returning from the turn', async () => {
+    setup();
+    let started = false;
+    let drained = false;
+    const request = turnRequest(h, dir, { resume: 'legacy-thread', prompt: '[legacy-tool]', tools: [{
+      name: 'legacy_probe', description: 'Current role team handler', inputSchema: {},
+      handler: async (_args, context) => {
+        started = true;
+        const signal = context as AbortSignal;
+        await new Promise<void>(resolve => signal.addEventListener('abort', () => setTimeout(resolve, 50), { once: true }));
+        drained = true;
+        return { content: [{ type: 'text', text: 'stopped' }] };
+      },
+    }] });
+    const run = new CodexRuntime(h.cfg.codex, fakeSpawn).run(request);
+    await until(() => started);
+    request.abortController.abort();
+    expect(await run).toMatchObject({ subtype: 'interrupted' });
+    expect(drained).toBe(true);
+  });
+
+  it('counts legacy aliases and MCP tools against the same side-effect budget', async () => {
+    setup();
+    let calls = 0;
+    let limited = false;
+    const request = turnRequest(h, dir, { maxTurns: 1, tools: [{ name: 'legacy_probe', description: 'Team tool', inputSchema: {},
+      handler: async () => { calls++; return { content: [{ type: 'text', text: 'first call' }] }; },
+    }] });
+    const bridge = await startBridge(request, () => { limited = true; });
+    const client = new Client({ name: 'test', version: '1.0' });
+    try {
+      expect((await bridge.call('legacy_probe', {}, request.abortController.signal)).isError).not.toBe(true);
+      await client.connect(new StreamableHTTPClientTransport(new URL(bridge.url), { requestInit: { headers: { Authorization: `Bearer ${bridge.token}` } } }));
+      expect((await client.callTool({ name: 'legacy_probe', arguments: {} })).isError).toBe(true);
+      expect(calls).toBe(1);
+      expect(limited).toBe(true);
+    } finally { await client.close(); await bridge.close(); }
   });
 
   it('checks CLI readiness, performs real MCP writes, and resumes the same session', async () => {
@@ -345,7 +456,7 @@ describe('Codex app-server integration', () => {
       expect((await fetch(bridge.url, { method: 'POST', headers: { Authorization: `Bearer ${bridge.token}`, Origin: 'https://example.com' } })).status).toBe(403);
       await client.connect(new StreamableHTTPClientTransport(new URL(bridge.url), { requestInit: { headers: { Authorization: `Bearer ${bridge.token}` } } }));
       const { tools } = await client.listTools();
-      expect(tools.map(t => t.name)).toEqual(['Read', 'Glob', 'Grep']);
+      expect(tools.map(t => t.name)).toEqual(['Read', 'Glob', 'Grep', 'Bash']);
     } finally { await client.close(); await bridge.close(); }
     await expect(fetch(bridge.url)).rejects.toThrow();
   });

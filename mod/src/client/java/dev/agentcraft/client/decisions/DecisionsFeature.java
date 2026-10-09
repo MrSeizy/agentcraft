@@ -13,6 +13,7 @@ import dev.agentcraft.client.foreman.ForemanState;
 import dev.agentcraft.client.foreman.Protocol.Decision;
 import dev.agentcraft.client.foreman.Protocol.DecisionKind;
 import dev.agentcraft.client.hud.Keys;
+import dev.agentcraft.client.ui.Guard;
 import dev.agentcraft.client.world.ServerTasks;
 import dev.agentcraft.client.world.StationInteractions;
 import java.util.HashMap;
@@ -53,7 +54,7 @@ public final class DecisionsFeature {
 		Keys.ensureRegistered();
 		DevBridge.registerScreen("decision", mc -> new DecisionScreen(null, null));
 		StationInteractions.onUse(ModBlocks.DECISION_PODIUM, (player, pos, state, be) -> openQueue(null, null));
-		ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+		ClientTickEvents.END_CLIENT_TICK.register(mc -> Guard.run("decisions.tick", () -> {
 			if (mc.player == null) {
 				return;
 			}
@@ -62,7 +63,7 @@ public final class DecisionsFeature {
 					openQueue(null, null);
 				}
 			}
-		});
+		}));
 		Foreman.addListener(new ForemanListener() {
 			@Override
 			public void onDecision(@Nullable Decision previous, Decision decision) {

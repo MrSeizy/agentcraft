@@ -62,11 +62,19 @@ export interface TestResult {
   summary?: string;
 }
 
-/** Pull failing test names and a summary line out of common test-runner output. */
+/**
+ * Pull failing test names and a summary line out of common test-runner output: TAP, and the spec
+ * reporter `node --test` uses by default on newer Node versions ("ℹ tests 15", "✖ name (1.2ms)").
+ */
 export function parseTestOutput(text: string): { failures: string[]; summary?: string } {
   const failures: string[] = [];
   for (const m of text.matchAll(/^not ok \d+ - (.+)$/gm)) failures.push(m[1]!.replace(/\\#/g, '#').replace(/\s+#\s*(TODO|SKIP).*$/i, '').trim());
-  if (!failures.length) for (const m of text.matchAll(/^\s*(?:✖|×|FAIL)\s+(.+)$/gm)) failures.push(m[1]!.trim());
+  if (!failures.length) {
+    for (const m of text.matchAll(/^\s*(?:✖|×|FAIL)\s+(.+)$/gm)) {
+      const name = m[1]!.replace(/\s+\(\d+(?:\.\d+)?m?s\)$/, '').trim();
+      if (!/^failing tests:?$/i.test(name)) failures.push(name);
+    }
+  }
   const nums: string[] = [];
   for (const k of ['tests', 'pass', 'fail']) {
     const m = new RegExp(`^(?:#|ℹ) ${k} (\\d+)$`, 'm').exec(text);
@@ -456,7 +464,7 @@ export class RepoManager {
    * then walks up to an enclosing repository). Checked before the Foreman writes with git in a
    * worktree (commits) or shows its diff for review. `head` is the symbolic ref HEAD points at.
    */
-  async verifyWorktreeGit(r: Repo, w: Worktree): Promise<{ ok: true; head: string } | { ok: false; reason: string }> {
+  async verifyWorktreeGit(r: Repo, w: Worktree): Promise<{ ok: true; head: string; gitDir: string; commonDir: string } | { ok: false; reason: string }> {
     if (!fs.existsSync(w.path)) return { ok: false, reason: `${w.path} does not exist` };
     const res = await git(w.path, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir', '--show-toplevel'], { allowFail: true });
     if (res.code !== 0) return { ok: false, reason: `git finds no repository at ${w.path} (its .git link is missing or broken)` };
@@ -475,7 +483,7 @@ export class RepoManager {
     }
     if (!back || !samePath(path.dirname(back), w.path)) return { ok: false, reason: `${w.path}/.git points at the worktree entry of ${back ? path.dirname(back) : 'another directory'}` };
     const head = (await git(w.path, ['symbolic-ref', '-q', 'HEAD'], { allowFail: true })).stdout.trim();
-    return { ok: true, head };
+    return { ok: true, head, gitDir: path.resolve(gitDir), commonDir: path.resolve(commonDir) };
   }
 
   /**

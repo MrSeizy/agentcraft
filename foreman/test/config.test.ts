@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { rmrf, tempDir } from './helpers.js';
@@ -22,6 +24,22 @@ describe('loadConfig argument checking', () => {
     expect(cfg.claude.effort).toBe('low');
     expect(cfg.claude.leadEffort).toBe('low');
     expect(cfg.notify).toBe(false);
+  });
+
+  it('reads lead read commands as a comma list or a config.json array', () => {
+    home = tempDir();
+    const read = (args: string[], env = {}) => loadConfig(['--home', home!, ...args], env).claude.leadReadCommands;
+    expect(read(['--lead-read-commands', 'bd show, bd list,'])).toEqual(['bd show', 'bd list']);
+    expect(read([], { AGENTCRAFT_LEAD_READ_COMMANDS: 'bd show' })).toEqual(['bd show']);
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ claude: { leadReadCommands: ['bd show'] } }));
+    expect(read([])).toEqual(['bd show']);
+  });
+
+  it('rejects lead read commands that could write or run code', () => {
+    home = tempDir();
+    for (const bad of ['rm', 'git status', './bd show', 'bd show; rm x', 'bd show > f', 'bash', 'bd $(x)']) {
+      expect(() => loadConfig(['--home', home!, '--lead-read-commands', bad], {})).toThrow(/lead read command/);
+    }
   });
 
   it('accepts the sim flags launch.ps1 passes', () => {
@@ -64,7 +82,7 @@ describe('user name', () => {
 
   it('is sent to the mod in foreman.status and used in prompts', async () => {
     const { makeForeman } = await import('./helpers.js');
-    const { leadSystemPrompt } = await import('../src/agents/claude/prompts.js');
+    const { leadSystemPrompt } = await import('../src/agents/prompts.js');
     home = tempDir();
     const h = makeForeman(home, ['--user-name', 'Sam']);
     try {

@@ -13,6 +13,7 @@ import dev.agentcraft.client.foreman.Protocol.Agent;
 import dev.agentcraft.client.foreman.Protocol.FeedItem;
 import dev.agentcraft.client.foreman.Protocol.Goal;
 import dev.agentcraft.client.foreman.Protocol.LogEntry;
+import dev.agentcraft.client.ui.Guard;
 import dev.agentcraft.layout.Anchor;
 import dev.agentcraft.layout.AnchorNames;
 import dev.agentcraft.layout.Anchors;
@@ -86,7 +87,7 @@ public final class MonitorFeature {
 			}
 		});
 		// forget screens whose panel has not been drawn for a while (broken, unloaded, re-shaped)
-		ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+		ClientTickEvents.END_CLIENT_TICK.register(mc -> Guard.run("monitor.sweep", () -> {
 			if (mc.level == null || (mc.level.getGameTime() % 200) != 0) {
 				return;
 			}
@@ -97,7 +98,7 @@ public final class MonitorFeature {
 					it.remove();
 				}
 			}
-		});
+		}));
 		DevBridge.register("dev.displays", 10_000, "{look?: paper|dark|split, reset?: bool} -> monitor look, laid-out monitor screens, "
 			+ "display CPU cost per frame since the last reset", (req, mc) -> {
 			Fields f = Fields.of(req);

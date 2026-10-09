@@ -14,6 +14,7 @@ import { Notifier } from './notifier.js';
 import type {
   Agent,
   AgentState,
+  BackendName,
   ClientMessage,
   Decision,
   ForemanStatus,
@@ -32,7 +33,7 @@ import { setUserName, userName } from './user.js';
 import { truncate } from './util/text.js';
 
 export interface Backend {
-  readonly name: import('./protocol.js').BackendName;
+  readonly name: BackendName;
   /** Called once after the core is ready (and after restart: resume work). */
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -201,7 +202,7 @@ export class Foreman {
   /** Patch an agent and broadcast if anything changed. */
   setAgent(
     id: string,
-    patch: Partial<Pick<Agent, 'state' | 'station' | 'activity' | 'paused' | 'active'>> & {
+    patch: Partial<Pick<Agent, 'state' | 'station' | 'activity' | 'paused' | 'active' | 'engine' | 'model'>> & {
       taskId?: string | null;
       repoId?: string | null;
       worktree?: string | null;
@@ -209,7 +210,7 @@ export class Foreman {
   ): Agent {
     const a = this.requireAgent(id);
     let changed = false;
-    const set = <K extends 'state' | 'station' | 'activity' | 'paused' | 'active'>(k: K, v: Agent[K] | undefined) => {
+    const set = <K extends 'state' | 'station' | 'activity' | 'paused' | 'active' | 'engine' | 'model'>(k: K, v: Agent[K] | undefined) => {
       if (v !== undefined && a[k] !== v) {
         a[k] = v;
         changed = true;
@@ -220,6 +221,8 @@ export class Foreman {
     if (patch.activity !== undefined) set('activity', truncate(patch.activity.replace(/\s+/g, ' ').trim(), 48));
     set('paused', patch.paused);
     set('active', patch.active);
+    set('engine', patch.engine);
+    set('model', patch.model);
     for (const k of ['taskId', 'repoId', 'worktree'] as const) {
       const v = patch[k];
       if (v === undefined) continue;

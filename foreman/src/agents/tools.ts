@@ -1,4 +1,4 @@
-// In-process MCP tools exposed to agents (server name "agentcraft"):
+// Provider-neutral team tools (Claude MCP or Codex/OpenAI tool calls):
 //   send_message, ask_user, write_memory, read_memory, update_task, report_status, list_tasks
 //   lead only: create_task, request_merge
 // Every tool result carries any unread messages for the agent (so mid-turn messages arrive).
@@ -8,11 +8,19 @@ import { formatInbox } from '../bus.js';
 import type { Foreman } from '../foreman.js';
 import type { AgentState, Decision, TaskStatus } from '../protocol.js';
 import { MERGE_OPTIONS } from '../protocol.js';
+import { isPrBranch } from '../pulls.js';
+export type { AgentTool } from './runtime.js';
 import { truncate } from '../util/text.js';
 import { boardSummary } from './prompts.js';
 import { userName } from '../user.js';
 
 export const MCP_SERVER = 'agentcraft';
+
+/** Names of the team tools for a role (unprefixed). */
+export const TOOL_NAMES = {
+  common: ['send_message', 'ask_user', 'write_memory', 'read_memory', 'update_task', 'report_status', 'list_tasks'],
+  lead: ['create_task', 'request_merge'],
+} as const;
 
 export interface ToolHooks {
   /** worker moved its task to review */
@@ -55,9 +63,7 @@ export async function closeIfNoChanges(fm: Foreman, taskId: string): Promise<boo
 }
 
 export function toolNames(role: 'lead' | 'worker'): string[] {
-  const common = ['send_message', 'ask_user', 'write_memory', 'read_memory', 'update_task', 'report_status', 'list_tasks'];
-  const lead = role === 'lead' ? ['create_task', 'request_merge'] : [];
-  return [...common, ...lead].map((n) => `mcp__${MCP_SERVER}__${n}`);
+  return [...TOOL_NAMES.common, ...(role === 'lead' ? TOOL_NAMES.lead : [])].map((n) => `mcp__${MCP_SERVER}__${n}`);
 }
 
 export function buildTeamTools(fm: Foreman, agentId: string, role: 'lead' | 'worker', hooks: ToolHooks, turn?: TurnHandle): AgentTool[] {
@@ -241,9 +247,11 @@ export function buildTeamTools(fm: Foreman, agentId: string, role: 'lead' | 'wor
           deps: z.array(z.string()).optional(),
           assignee: z.string().optional().describe('worker id/name'),
           priority: z.number().int().optional(),
+          start_branch: z.string().optional().describe('only for a fetched pull request: its branch, e.g. "agentcraft/pr-12"; the worker starts from the contributor\'s commits'),
         },
-        async ({ title, description, deps, assignee, priority }) => {
+        async ({ title, description, deps, assignee, priority, start_branch }) => {
           const goal = fm.currentGoal();
+          if (start_branch && !isPrBranch(start_branch)) return fail(`start_branch must be a fetched pull request branch (agentcraft/pr-<n>), not ${start_branch}`);
           let who: string | undefined;
           if (assignee) {
             who = fm.resolveAgentId(assignee);
@@ -257,6 +265,7 @@ export function buildTeamTools(fm: Foreman, agentId: string, role: 'lead' | 'wor
               deps: deps ?? [],
               ...(who ? { assignee: who } : {}),
               ...(priority !== undefined ? { priority } : {}),
+              ...(start_branch ? { startBranch: start_branch } : {}),
               createdBy: agentId,
               ...(goal ? { goalId: goal.id } : {}),
               ...(goal?.repoId ? { repoId: goal.repoId } : {}),
@@ -310,3 +319,6 @@ export function buildTeamTools(fm: Foreman, agentId: string, role: 'lead' | 'wor
 
   return tools;
 }
+
+/** Engine API compatibility; all providers share the same tools and validated handlers. */
+export const agentTools = buildTeamTools;

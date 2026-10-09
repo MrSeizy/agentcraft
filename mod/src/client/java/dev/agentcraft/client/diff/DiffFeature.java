@@ -3,6 +3,7 @@ package dev.agentcraft.client.diff;
 import com.google.gson.JsonObject;
 import dev.agentcraft.block.ModBlocks;
 import dev.agentcraft.block.entity.ModBlockEntities;
+import dev.agentcraft.client.decisions.DiffLink;
 import dev.agentcraft.client.dev.DevBridge;
 import dev.agentcraft.client.dev.Fields;
 import dev.agentcraft.client.foreman.Foreman;
@@ -44,6 +45,9 @@ public final class DiffFeature {
 	public static void init() {
 		BlockEntityRenderers.register(ModBlockEntities.MERGE_STATION, ctx -> new MergeStationRenderer());
 		DevBridge.registerScreen("diff", mc -> new DiffScreen(defaultTarget()));
+		// D on a merge decision and /diff review exactly that decision / worktree (not the oldest open merge)
+		DiffLink.setOpener((repoId, worktree, decision, parent) -> new DiffScreen(decision != null
+			? new DiffScreen.Target(decision.id(), repoId, worktree) : forWorktree(repoId, worktree)));
 		StationInteractions.onUse(ModBlocks.MERGE_STATION, (player, pos, state, be) -> {
 			List<Decision> queue = MergeStationRenderer.queue();
 			int k = MergeStationRenderer.rowIndex(player.level(), pos, state);

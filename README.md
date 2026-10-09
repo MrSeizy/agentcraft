@@ -10,7 +10,7 @@
 [![Minecraft 26.3](https://img.shields.io/badge/Minecraft-26.3-8fa98b)](https://www.minecraft.net)
 [![Fabric](https://img.shields.io/badge/mod%20loader-Fabric-d97757)](https://fabricmc.net)
 [![Claude Agent SDK](https://img.shields.io/badge/agents-Claude%20Agent%20SDK-2fa3a0)](https://code.claude.com/docs/en/agent-sdk/overview)
-[![Tests](https://img.shields.io/badge/tests-482%20passing-3b2a20)](foreman/test)
+[![Tests](https://img.shields.io/badge/tests-548%20passing-3b2a20)](foreman/test)
 
 <img src="docs/img/readme/hero.jpg" alt="The AgentCraft HQ at golden hour" width="100%">
 
@@ -165,7 +165,7 @@ AgentCraft is built to point at code you care about.
 
 ## Quick start
 
-**You need:** Windows 10 or 11, or macOS, Java 25, Node 22+, git, and a copy of
+**You need:** Windows 10 or 11, macOS, or Linux, Java 25, Node 22+, git, and a copy of
 Minecraft: Java Edition.
 
 **For real agents**, choose Claude, Codex CLI, or an OpenAI-compatible API. Claude remains the default.
@@ -201,29 +201,31 @@ tools\launch.ps1 -Repo C:\path\to\your\repo      # real agents on your repo
 tools\stop.ps1                                   # stop everything launch.ps1 started
 ```
 
-On macOS, install Java 25 with `brew install openjdk@25`, then run from the checkout
-(the script selects that JDK without changing your system Java):
+On macOS, install Java 25 with `brew install openjdk@25`. On Linux, install your distribution's
+Java 25 JDK (on Arch: `pacman -S jdk25-openjdk`) or point `JAVA_HOME` at one. Then run from the
+checkout (the script selects that JDK without changing your system Java):
 
 ```sh
-node tools/mac.mjs launch --backend sim                 # try the studio without API usage
-node tools/mac.mjs stop --profile sim
-node tools/mac.mjs launch --repo /path/to/your/repo --use-claude-login
-node tools/mac.mjs stop
+node tools/unix.mjs launch --backend sim                 # try the studio without API usage
+node tools/unix.mjs stop --profile sim
+node tools/unix.mjs launch --repo /path/to/your/repo --use-claude-login
+node tools/unix.mjs stop
 
 # Codex (your saved login; model defaults to the Codex CLI default)
-node tools/mac.mjs launch --backend codex --repo /path/to/your/repo
+node tools/unix.mjs launch --backend codex --repo /path/to/your/repo
 
 # OpenAI-compatible server (set AGENTCRAFT_API_KEY in your shell if a key is required)
-node tools/mac.mjs launch --backend openai --repo /path/to/your/repo \
+node tools/unix.mjs launch --backend openai --repo /path/to/your/repo \
   --foreman-arg --base-url --foreman-arg http://localhost:11434/v1 \
   --foreman-arg --model --foreman-arg your-model-id \
   --foreman-arg --api-key-env --foreman-arg AGENTCRAFT_API_KEY
 ```
 
-The macOS launcher installs npm dependencies on first run, downloads Minecraft and Fabric
+This launcher installs npm dependencies on first run, downloads Minecraft and Fabric
 through Gradle, starts the Foreman and game in the background, and waits for the studio world.
-Use `--dev` for a muted client that does not take focus; `--no-game` starts only the Foreman.
-See [tools/README.md](tools/README.md) for options and logs.
+Use `--dev` for a muted client that does not take focus; `--no-game` starts only the Foreman,
+which is also how you pair it with your own launcher instance (Prism and the like).
+See [tools/README.md](tools/README.md) for options, logs and the own-launcher setup.
 
 The first launch installs npm dependencies and lets Gradle download Minecraft and Fabric, which
 takes a few minutes. After that, a launch reaches the studio in under a minute. The HQ builds itself
@@ -234,6 +236,20 @@ the first time; in an older world, rebuild it with `/agentcraft hq`.
 > third party tools to offer claude.ai login to their users, so this is off by default and meant for
 > running AgentCraft yourself. To make it permanent for yourself, put
 > `{"claude": {"useClaudeLogin": true}}` in `~/.agentcraft/config.json`.
+
+**Codex.** AgentCraft also runs Codex agents. With the Codex CLI or the Codex desktop app installed
+and logged in (`codex login`, with ChatGPT or an OpenAI API key):
+
+```powershell
+tools\launch.ps1 -Backend codex -Repo C:\path\to\your\repo                       # an all-Codex team
+tools\launch.ps1 -Repo C:\path\to\your\repo -ForemanArgs '--worker-engine','codex'   # Claude lead, Codex workers
+```
+
+Codex agents live in the same studio and follow the same rules: their own git worktrees, every command
+checked by AgentCraft's policy (and asked in game when it needs you), the lead's review, and your
+**Merge**. They never get your own Codex MCP servers, plugins, apps or web search. Pick models with
+`--codex-model`, and mix engines per agent with `--engines kit=codex,wren=claude`. Every agent's nameplate shows the
+model it runs, like **Opus 5.5** or **GPT-6 Astra**, so a mixed team is easy to read at a glance.
 
 **Your name.** The agents call you by your OS user name. Change it with
 `-ForemanArgs '--user-name','Sam'`, `AGENTCRAFT_USER_NAME`, or `{"userName": "Sam"}` in
@@ -329,7 +345,7 @@ the workers resolved, took 2 to 10 minutes each and about $6 in total. The sim b
 
 Codex uses your configured CLI authentication; API endpoints follow their own pricing. AgentCraft
 shows dollar costs only when the provider reports them. `--max-budget` is Claude-only; all real
-backends support `--max-turns` (Codex counts tool calls).
+backends support `--max-turns` (Codex counts tool calls). Codex monitors show token usage when reported.
 
 <br>
 

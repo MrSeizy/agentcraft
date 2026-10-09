@@ -52,6 +52,8 @@ Exact option labels: merge decisions use `Merge`, `Request changes`, `Reject`; p
 | `worktree` | string | no | id of the worktree the agent is working in (see Repo.worktrees) |
 | `paused` | boolean | yes |  |
 | `active` | boolean | yes | false = off shift (not on the current team, or stopped by the user); render idle in the lounge |
+| `engine` | `claude` \| `codex` \| `openai` | no | which engine runs this agent (absent: the sim) |
+| `model` | string | no | the model it runs, for display, e.g. "Opus 5.5" or "GPT-6 Astra" (the real model once a turn reported it) |
 
 ### <a id="logentry"></a>LogEntry
 
@@ -75,6 +77,7 @@ Exact option labels: merge decisions use `Merge`, `Request changes`, `Reject`; p
 | `goalId` | string | no |  |
 | `priority` | integer | yes | higher = sooner; default 0 |
 | `branch` | string | no | git branch, e.g. "agentcraft/kit/t2-tag-parser" |
+| `startBranch` | string | no | the worker's branch starts from this branch instead of the base, e.g. a fetched pull request "agentcraft/pr-12" |
 | `worktree` | string | no |  |
 | `ci` | [CiStatus](#cistatus) | yes |  |
 | `blockedReason` | string | no |  |

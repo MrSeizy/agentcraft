@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// macOS launcher for the Foreman and the Fabric development client.
+// macOS and Linux launcher for the Foreman and the Fabric development client.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -17,18 +17,18 @@ const saveJson = (file, value) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n');
 };
-const runFile = (kind, profile) => path.join(runDir, `mac-${kind}-${profile}.json`);
+const runFile = (kind, profile) => path.join(runDir, `unix-${kind}-${profile}.json`);
 const resolveUserPath = (value) => path.resolve(value.replace(/^~(?=$|\/)/, () => os.homedir()));
 
 function usage(code = 0) {
-  console.log(`AgentCraft macOS launcher
-  node tools/mac.mjs launch [--backend sim|claude|codex|openai] [--repo PATH] [--use-claude-login]
+  console.log(`AgentCraft launcher (macOS, Linux)
+  node tools/unix.mjs launch [--backend sim|claude|codex|openai] [--repo PATH] [--use-claude-login]
                             [--home PATH] [--profile NAME] [--port N] [--dev-port N]
                             [--dev] [--showcase busy|late] [--reset]
                             [--no-game] [--no-foreman] [--no-wait]
                             [--summary-json PATH]
                             [--foreman-arg VALUE] (repeatable)
-  node tools/mac.mjs stop [--game] [--foreman] [--profile NAME] [--stop-daemon]
+  node tools/unix.mjs stop [--game] [--foreman] [--profile NAME] [--stop-daemon]
 
 Default: Claude backend, ~/.agentcraft, ports 7878/7879. --dev mutes the game,
 keeps it from taking focus, and disables desktop notifications.`);
@@ -99,16 +99,24 @@ async function waitPort(port, timeoutMs, info, name) {
   throw new Error(`${name} did not start in time; see ${info?.log ?? 'its logs'}`);
 }
 
+const JDK_CANDIDATES = {
+  darwin: ['/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home', '/usr/local/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home'],
+  linux: ['/usr/lib/jvm/java-25-openjdk', '/usr/lib/jvm/java-25-openjdk-amd64', '/usr/lib/jvm/java-25-openjdk-arm64'],
+};
+const JDK_HINT = {
+  darwin: 'brew install openjdk@25',
+  linux: 'your distribution\'s package manager (Arch: pacman -S jdk25-openjdk), or set JAVA_HOME to a Java 25 JDK',
+};
+
 function javaHome() {
-  const candidates = [process.env.JAVA_HOME, '/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home', '/usr/local/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home'];
-  for (const candidate of candidates) {
+  for (const candidate of [process.env.JAVA_HOME, ...JDK_CANDIDATES[process.platform]]) {
     if (!candidate) continue;
     const java = path.join(candidate, 'bin', 'java');
     if (!fs.existsSync(java)) continue;
     const result = spawnSync(java, ['-version'], { encoding: 'utf8' });
     if (/version "25[.\"]/.test(result.stderr + result.stdout)) return candidate;
   }
-  throw new Error('Java 25 is required. Install it with: brew install openjdk@25');
+  throw new Error(`Java 25 is required. Install it with ${JDK_HINT[process.platform]}`);
 }
 
 function installDeps(dir) {
@@ -141,7 +149,7 @@ function runCli(script, args, timeout = 30000) {
 
 function prepareAudio(dev) {
   const optionsFile = path.join(root, 'mod', 'run', 'options.txt');
-  const savedFile = path.join(runDir, 'mac-audio.json');
+  const savedFile = path.join(runDir, 'unix-audio.json');
   const template = path.join(root, 'mod', 'run-template', 'options.txt');
   const level = (text, name) => new RegExp(`^soundCategory_${name}:([^\\n]+)$`, 'm').exec(text)?.[1];
   const replace = (text, name, value) => text.replace(new RegExp(`^soundCategory_${name}:[^\\n]+$`, 'm'), `soundCategory_${name}:${value}`);
@@ -169,7 +177,7 @@ function prepareAudio(dev) {
 }
 
 async function launch(opt, summary) {
-  if (process.platform !== 'darwin') throw new Error('tools/mac.mjs is for macOS');
+  if (!(process.platform in JDK_CANDIDATES)) throw new Error('tools/unix.mjs is for macOS and Linux; use tools/launch.ps1 on Windows');
   if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('Node 22+ is required');
   fs.mkdirSync(runDir, { recursive: true });
   fs.mkdirSync(logDir, { recursive: true });
@@ -199,7 +207,7 @@ async function launch(opt, summary) {
       if (opt.showcase) args.push('--showcase', opt.showcase);
       if (opt.reset || opt.showcase) args.push('--reset');
       args.push(...opt.foremanArgs);
-      fm = { ...start(process.execPath, args, path.join(root, 'foreman'), path.join(logDir, `mac-foreman-${opt.profile}.log`)), backend: opt.backend, port: fmPort, home: opt.home };
+      fm = { ...start(process.execPath, args, path.join(root, 'foreman'), path.join(logDir, `unix-foreman-${opt.profile}.log`)), backend: opt.backend, port: fmPort, home: opt.home };
       saveJson(fmFile, fm);
       summary.foreman.started = true;
       await waitPort(fmPort, 120000, fm, 'Foreman');
@@ -211,7 +219,7 @@ async function launch(opt, summary) {
   if (opt['no-game']) return;
 
   const gameFile = runFile('game', opt.profile);
-  for (const name of fs.readdirSync(runDir).filter((name) => /^mac-game-[\w-]+\.json$/.test(name))) {
+  for (const name of fs.readdirSync(runDir).filter((name) => /^unix-game-[\w-]+\.json$/.test(name))) {
     const otherFile = path.join(runDir, name);
     if (otherFile !== gameFile && owned(readJson(otherFile))) {
       throw new Error(`another Minecraft client from this checkout is running (${name}); stop it before switching profiles`);
@@ -234,7 +242,7 @@ async function launch(opt, summary) {
     AGENTCRAFT_HOME: opt.home, AGENTCRAFT_PROFILE: opt.profile,
     AGENTCRAFT_MUTE: opt.dev ? '1' : '0', AGENTCRAFT_FOCUS: opt.dev ? '0' : '1',
   };
-  game = { ...start('/bin/sh', [path.join(root, 'mod', 'gradlew'), 'runClient', '--console=plain'], path.join(root, 'mod'), path.join(logDir, 'mac-game.log'), env), devPort: opt['dev-port'], foremanPort: fmPort };
+  game = { ...start('/bin/sh', [path.join(root, 'mod', 'gradlew'), 'runClient', '--console=plain'], path.join(root, 'mod'), path.join(logDir, 'unix-game.log'), env), devPort: opt['dev-port'], foremanPort: fmPort };
   saveJson(gameFile, game);
   summary.game.started = true;
   console.log(`Starting Minecraft (Gradle PID ${game.pid}); log: ${game.log}`);
@@ -243,7 +251,7 @@ async function launch(opt, summary) {
   console.log('Waiting for the studio world...');
   const state = JSON.parse(runCli('devcli.mjs', ['wait', '--port', String(game.devPort), '--timeout', '300'], 310000));
   console.log(`Studio ready: Minecraft ${state.minecraft}, world ${state.world?.name ?? 'unknown'}, Foreman ${state.foreman?.link ?? 'unknown'}`);
-  console.log(`Ready. Stop with: node tools/mac.mjs stop --profile ${opt.profile}`);
+  console.log(`Ready. Stop with: node tools/unix.mjs stop --profile ${opt.profile}`);
 }
 
 async function stop(opt) {

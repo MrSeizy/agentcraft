@@ -87,8 +87,9 @@ export class TurnReporter {
     Object.assign(this.stats, stats);
     this.stats.subtype ??= this.stats.isError ? 'error' : 'success';
     const cost = typeof this.stats.costUsd === 'number' ? ` · $${this.stats.costUsd.toFixed(3)}` : '';
+    const tokens = typeof this.stats.tokens === 'number' ? ` · ${Math.round(this.stats.tokens / 1000)}k tokens` : '';
     this.fm.agentLog(this.agentId, this.stats.isError ? 'error' : 'result',
-      `turn ${this.stats.isError ? `ended: ${this.stats.subtype}` : 'complete'} (${this.stats.numTurns ?? 1} steps${cost})`);
+      `turn ${this.stats.isError ? `ended: ${this.stats.subtype}` : 'complete'} (${this.stats.numTurns ?? 1} steps${cost}${tokens})`);
     if (this.stats.isError) {
       for (const error of [...new Set(this.stats.errors)].slice(0, 5)) this.fm.agentLog(this.agentId, 'error', truncate(error, 1200));
     }

@@ -28,6 +28,8 @@ export interface SessionRecord {
   provider?: import('./protocol.js').BackendName;
   sessionId?: string;
   model?: string;
+  /** the engine whose session this is (absent: claude, from before engines) */
+  engine?: 'claude' | 'codex' | 'openai';
   turns: number;
   costUsd: number;
   updatedAt: number;

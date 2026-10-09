@@ -15,8 +15,8 @@ export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.
 export interface TeamConfig {
   leadModel: string;
   workerModel: string;
-  effort: EffortLevel;
-  leadEffort: EffortLevel;
+  effort?: EffortLevel;
+  leadEffort?: EffortLevel;
   maxTurnsLead: number;
   maxTurnsWorker: number;
   /** max workers running a turn at the same time */
@@ -31,6 +31,8 @@ export interface TeamConfig {
   resumeOnStart: boolean;
   /** lead reviews each finished task before the merge decision reaches the user */
   leadReview: boolean;
+  /** command prefixes the lead runs without asking, e.g. `bd show` */
+  leadReadCommands: string[];
 }
 
 export interface ClaudeConfig extends TeamConfig {
@@ -38,8 +40,20 @@ export interface ClaudeConfig extends TeamConfig {
   useClaudeLogin: boolean;
 }
 
+export type EngineName = 'claude' | 'codex';
+export const ENGINE_NAMES: readonly EngineName[] = ['claude', 'codex'];
+
+/** Which engine runs the lead, the workers, and per-agent exceptions (`--engines kit=codex`). */
+export interface EngineChoice {
+  lead: EngineName;
+  worker: EngineName;
+  byAgent: Record<string, EngineName>;
+}
+
 export interface CodexConfig extends TeamConfig {
+  /** Both --codex-command and --codex-path select this executable. */
   command: string;
+  path?: string;
 }
 
 export interface OpenAIConfig extends TeamConfig {
@@ -92,9 +106,11 @@ export interface Config {
   mergeStyle: 'merge' | 'squash';
   /** sign approved merge commits when the repo's own git config says commit.gpgsign=true */
   signMerges: boolean;
+  /** team settings (workers, CI, review, lead read commands) and the Claude engine's options */
   claude: ClaudeConfig;
   codex: CodexConfig;
   openai: OpenAIConfig;
+  engines: EngineChoice;
   sim: SimConfig;
 }
 
@@ -148,6 +164,34 @@ function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length ? v : undefined;
 }
 
+/** Comma list (flag, env) or array (config.json). */
+function list(v: unknown): string[] {
+  const items = Array.isArray(v) ? v.map(String) : typeof v === 'string' ? v.split(',') : [];
+  return items.map((s) => s.trim()).filter(Boolean);
+}
+
+/** Programs that can write, run other code or reach the network: never declarable as lead "read" commands. */
+const NOT_READ_ONLY = new Set([
+  'git', 'rm', 'mv', 'cp', 'tee', 'dd', 'sed', 'awk', 'find', 'xargs', 'env', 'sudo', 'sh', 'bash', 'zsh',
+  'node', 'npm', 'npx', 'python', 'python3', 'pip', 'perl', 'ruby', 'curl', 'wget', 'ssh', 'scp', 'eval', 'exec',
+  'cmd', 'powershell', 'pwsh', 'touch', 'mkdir', 'chmod', 'kill',
+]);
+
+/** Each entry is a bare program name plus plain words ("bd show"): no paths, shell syntax, or writers/interpreters. */
+function readCommands(v: unknown): string[] {
+  const entries = list(v);
+  for (const e of entries) {
+    const [head = '', ...words] = e.split(/\s+/);
+    if (!/^[A-Za-z0-9_.+-]+$/.test(head) || !words.every((w) => /^[A-Za-z0-9_.:@+=-]+$/.test(w))) {
+      throw new Error(`bad lead read command "${e}" (use a bare program name and plain words, like "bd show")`);
+    }
+    if (NOT_READ_ONLY.has(head.toLowerCase().replace(/\.(exe|cmd|bat)$/, ''))) {
+      throw new Error(`lead read command "${e}" is not allowed: "${head}" can write files, run code or use the network`);
+    }
+  }
+  return entries;
+}
+
 function mergeStyle(v: unknown): 'merge' | 'squash' {
   if (v === undefined || v === 'merge') return 'merge';
   if (v === 'squash') return 'squash';
@@ -168,7 +212,28 @@ export const KNOWN_FLAGS = new Set([
   'lead-model', 'worker-model', 'effort', 'lead-effort', 'max-turns', 'max-turns-lead', 'max-turns-worker',
   'max-concurrent', 'ci', 'max-budget', 'resume', 'lead-review', 'speed', 'seed', 'showcase', 'auto-answer',
   'ambient', 'base-url', 'api-key-env', 'api', 'request-timeout', 'codex-command',
+  'lead-read-commands', 'lead-engine', 'worker-engine', 'engines', 'codex-path', 'codex-model', 'codex-lead-model',
+  'codex-worker-model', 'codex-effort', 'codex-lead-effort',
 ]);
+
+function engineName(v: unknown, d: EngineName, what: string): EngineName {
+  if (v === undefined || v === '') return d;
+  if (typeof v === 'string' && (ENGINE_NAMES as string[]).includes(v)) return v as EngineName;
+  throw new Error(`unknown ${what} "${String(v)}" (use ${ENGINE_NAMES.join(' or ')})`);
+}
+
+/** "kit=codex,wren=claude" (flag/env) or {"kit": "codex"} (config.json) */
+function engineMap(v: unknown): Record<string, EngineName> {
+  const pairs: Array<[string, unknown]> =
+    v && typeof v === 'object' && !Array.isArray(v) ? Object.entries(v as Record<string, unknown>) : list(v).map((e) => e.split('=').map((x) => x.trim()) as [string, string]);
+  const out: Record<string, EngineName> = {};
+  for (const [agent, engine] of pairs) {
+    if (!agent || !/^[a-z0-9_-]+$/i.test(agent)) throw new Error(`bad --engines entry "${agent}=${String(engine)}" (use agent=engine, e.g. kit=codex)`);
+    if (engine === undefined || engine === '') throw new Error(`no engine for ${agent} in --engines (use agent=engine, e.g. ${agent}=codex)`);
+    out[agent.toLowerCase()] = engineName(engine, 'claude', `engine for ${agent}`);
+  }
+  return out;
+}
 
 /**
  * Unknown flags and stray positionals are errors, not silently ignored: a mistyped or mangled flag
@@ -218,11 +283,11 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
   };
 
   const model = str(flags.model);
-  const teamConfig = (section: Record<string, unknown>, defaults: [string, string], envModel?: string): TeamConfig => ({
-    leadModel: str(flags['lead-model']) ?? model ?? str(env.AGENTCRAFT_LEAD_MODEL) ?? envModel ?? str(section.leadModel) ?? defaults[0],
-    workerModel: str(flags['worker-model']) ?? model ?? str(env.AGENTCRAFT_WORKER_MODEL) ?? envModel ?? str(section.workerModel) ?? defaults[1],
-    effort: effort(flags.effort ?? section.effort, 'medium'),
-    leadEffort: effort(flags['lead-effort'] ?? flags.effort ?? section.leadEffort, 'medium'),
+  const teamConfig = (section: Record<string, unknown>, defaults: [string, string], envModel?: string, useGenericModels = true): TeamConfig => ({
+    leadModel: (useGenericModels ? str(flags['lead-model']) ?? model ?? str(env.AGENTCRAFT_LEAD_MODEL) ?? envModel : undefined) ?? str(section.leadModel) ?? defaults[0],
+    workerModel: (useGenericModels ? str(flags['worker-model']) ?? model ?? str(env.AGENTCRAFT_WORKER_MODEL) ?? envModel : undefined) ?? str(section.workerModel) ?? defaults[1],
+    effort: effort((useGenericModels ? flags.effort : undefined) ?? section.effort, 'medium'),
+    leadEffort: effort((useGenericModels ? flags['lead-effort'] ?? flags.effort : undefined) ?? section.leadEffort, 'medium'),
     maxTurnsLead: num(flags['max-turns-lead'] ?? flags['max-turns'] ?? section.maxTurnsLead, 40),
     maxTurnsWorker: num(flags['max-turns-worker'] ?? flags['max-turns'] ?? section.maxTurnsWorker, 80),
     maxConcurrent: Math.max(1, num(flags['max-concurrent'] ?? section.maxConcurrent, 3)),
@@ -231,6 +296,7 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     maxBudgetUsdPerTurn: flags['max-budget'] !== undefined ? num(flags['max-budget'], 0) || undefined : (section.maxBudgetUsdPerTurn as number | undefined),
     resumeOnStart: bool(flags.resume ?? section.resumeOnStart, true),
     leadReview: bool(flags['lead-review'] ?? section.leadReview, true),
+    leadReadCommands: readCommands(flags['lead-read-commands'] ?? env.AGENTCRAFT_LEAD_READ_COMMANDS ?? section.leadReadCommands ?? fileClaude.leadReadCommands),
   });
   const baseUrl = str(flags['base-url']) ?? str(env.OPENAI_BASE_URL) ?? str(fileOpenAI.baseUrl) ?? 'https://api.openai.com/v1';
   const apiKeyEnv = str(flags['api-key-env']) ?? str(fileOpenAI.apiKeyEnv) ?? 'OPENAI_API_KEY';
@@ -243,6 +309,9 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
       throw new Error('base-url must be HTTP(S) without credentials, query or fragment');
     }
   }
+  const codexEffort = flags['codex-effort'] ?? (backend === 'codex' ? flags.effort : undefined) ?? fileCodex.effort;
+  const codexLeadEffort = flags['codex-lead-effort'] ?? flags['codex-effort']
+    ?? (backend === 'codex' ? flags['lead-effort'] ?? flags.effort : undefined) ?? fileCodex.leadEffort ?? fileCodex.effort;
   const cfg: Config = {
     backend,
     userName: (str(pick('user-name', 'AGENTCRAFT_USER_NAME')) ?? str(file.userName))?.trim().slice(0, 40) || defaultUserName(),
@@ -266,12 +335,27 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     // the sim answers merges unattended (screenshot QA, --auto-answer): never sign there
     signMerges: bool(pick('sign-merges', 'AGENTCRAFT_SIGN_MERGES'), backend !== 'sim'),
     claude: {
-      ...teamConfig(fileClaude, ['opus', 'sonnet']),
+      ...teamConfig(fileClaude, ['opus', 'sonnet'], undefined, backend !== 'codex' && backend !== 'openai'),
       useClaudeLogin: bool(flags['use-claude-login'] ?? env.AGENTCRAFT_USE_CLAUDE_LOGIN ?? fileClaude.useClaudeLogin, false),
     },
+    engines: {
+      lead: engineName(pick('lead-engine', 'AGENTCRAFT_LEAD_ENGINE') ?? (file.engines as Record<string, unknown> | undefined)?.lead, backend === 'codex' ? 'codex' : 'claude', 'lead engine'),
+      worker: engineName(pick('worker-engine', 'AGENTCRAFT_WORKER_ENGINE') ?? (file.engines as Record<string, unknown> | undefined)?.worker, backend === 'codex' ? 'codex' : 'claude', 'worker engine'),
+      byAgent: engineMap(flags.engines ?? env.AGENTCRAFT_ENGINES ?? (file.engines as Record<string, unknown> | undefined)?.byAgent),
+    },
     codex: {
-      ...teamConfig(fileCodex, ['', '']),
-      command: str(flags['codex-command']) ?? str(env.AGENTCRAFT_CODEX_COMMAND) ?? str(fileCodex.command) ?? 'codex',
+      ...teamConfig({ ...fileClaude, maxBudgetUsdPerTurn: undefined, ...fileCodex }, ['', '']),
+      // Generic model flags select the backend's models; Codex-specific flags also work in mixed teams.
+      leadModel: str(flags['codex-lead-model']) ?? str(flags['codex-model'])
+        ?? (backend === 'codex' ? str(flags['lead-model']) ?? model ?? str(env.AGENTCRAFT_LEAD_MODEL) : undefined)
+        ?? str(fileCodex.leadModel) ?? str(fileCodex.model) ?? '',
+      workerModel: str(flags['codex-worker-model']) ?? str(flags['codex-model'])
+        ?? (backend === 'codex' ? str(flags['worker-model']) ?? model ?? str(env.AGENTCRAFT_WORKER_MODEL) : undefined)
+        ?? str(fileCodex.workerModel) ?? str(fileCodex.model) ?? '',
+      effort: codexEffort === undefined ? undefined : effort(codexEffort, 'medium'),
+      leadEffort: codexLeadEffort === undefined ? undefined : effort(codexLeadEffort, 'medium'),
+      command: str(flags['codex-command']) ?? str(flags['codex-path']) ?? str(env.AGENTCRAFT_CODEX_COMMAND) ?? str(env.AGENTCRAFT_CODEX_PATH) ?? str(fileCodex.command) ?? str(fileCodex.path) ?? 'codex',
+      path: str(flags['codex-command']) ?? str(flags['codex-path']) ?? str(env.AGENTCRAFT_CODEX_COMMAND) ?? str(env.AGENTCRAFT_CODEX_PATH) ?? str(fileCodex.command) ?? str(fileCodex.path),
     },
     openai: {
       ...teamConfig(fileOpenAI, ['', ''], str(env.OPENAI_MODEL)),
@@ -296,7 +380,8 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
   }
   if (backend === 'openai' && (!cfg.openai.leadModel || !cfg.openai.workerModel)) throw new Error('OpenAI-compatible endpoints require --model (or OPENAI_MODEL / openai.leadModel + workerModel in config.json)');
   if (backend === 'openai' && (!Number.isInteger(cfg.openai.timeoutMs) || cfg.openai.timeoutMs < 1)) throw new Error('request-timeout must be a positive number of milliseconds');
-  if (backend === 'codex' && [cfg.codex.effort, cfg.codex.leadEffort].includes('max')) throw new Error('Codex effort supports low, medium, high or xhigh');
+  const usesCodex = (backend === 'codex' || backend === 'claude') && [cfg.engines.lead, cfg.engines.worker, ...Object.values(cfg.engines.byAgent)].includes('codex');
+  if (usesCodex && [cfg.codex.effort, cfg.codex.leadEffort].includes('max')) throw new Error('Codex effort supports low, medium, high or xhigh');
   if (cfg.sim.showcase) cfg.autostart = true;
   return cfg;
 }
@@ -354,12 +439,27 @@ usage: npm run start -- [options]
  shared real-agent options (config sections: claude, codex, openai)
   --model <m>              model for lead and workers (Claude defaults: opus / sonnet)
   --lead-model <m> / --worker-model <m>
-  --effort low|medium|high|xhigh|max   Claude/Codex reasoning effort (default medium; max: Claude only)
+  --effort low|medium|high|xhigh|max   reasoning effort (Claude: medium; Codex: CLI config; max: Claude only)
   --max-turns <n>          cap per job (default lead 40 / worker 80; Codex: tool calls)
   --workers <n|ids>        team size or comma list (default juniper,kit,wren)
   --max-concurrent <n>     workers running at once (default 3)
   --max-budget <usd>       per-turn USD cap (Claude only)
   --ci "<cmd>"             test command run after each task (default: detected, e.g. npm test)
+  --lead-read-commands "<cmd>,..."
+                           read commands the lead runs without asking, by prefix, e.g.
+                           "bd show,gh issue view" (env AGENTCRAFT_LEAD_READ_COMMANDS)
   --no-lead-review         skip the lead's review turn before merge decisions
   --no-resume              do not resume interrupted sessions on start
+
+ codex engine (--backend codex, or mixed teams)
+  auth: your Codex login (\`codex login\`: ChatGPT or an OpenAI API key)
+  --lead-engine claude|codex / --worker-engine claude|codex
+                           mix engines (default: the backend's), e.g. a Claude lead with Codex workers
+  --engines <agent=engine,...>  per agent, e.g. kit=codex,wren=claude (env AGENTCRAFT_ENGINES)
+  --codex-path <path>      the codex CLI (default: on PATH, else the Codex desktop app's)
+  --codex-model <m>        model for Codex agents (default: your Codex config's model)
+  --codex-lead-model <m> / --codex-worker-model <m>
+  --codex-effort <e>       reasoning effort (low|medium|high|xhigh; default: your Codex config's)
+  Codex agents get none of your own MCP servers, plugins, web search or apps; every command and
+  out-of-worktree edit goes through the same policy and in-game permission prompts.
 `;

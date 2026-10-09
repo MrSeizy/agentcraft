@@ -19,6 +19,8 @@ export interface TurnStats {
   isError: boolean;
   costUsd?: number;
   numTurns?: number;
+  /** Token usage for providers that report tokens instead of cost. */
+  tokens?: number;
   authFailed?: string;
   errors: string[];
 }
@@ -51,7 +53,7 @@ export interface TurnRequest {
   cwd: string;
   role: 'lead' | 'worker';
   model: string;
-  effort: EffortLevel;
+  effort?: EffortLevel;
   maxTurns: number;
   maxBudgetUsd?: number;
   resume?: string;
@@ -62,6 +64,7 @@ export interface TurnRequest {
   reporter: TurnReporter;
   onSession(id: string): void;
   onSpawn(child: ChildProcess): void;
+  onModel?(model: string): void;
   /** Live input: true only once consumed, not merely queued. False retains it for redelivery. */
   onSteerReady?(steer: (prompt: string) => Promise<boolean>): void;
 }
@@ -69,6 +72,7 @@ export interface TurnRequest {
 export interface AgentRuntime {
   readonly name: 'claude' | 'codex' | 'openai';
   readonly label: string;
+  model?(role: 'lead' | 'worker'): string | undefined;
   /** Checks local configuration/auth without generating a model response. */
   checkAuth(): Promise<string>;
   env?(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv;

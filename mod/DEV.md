@@ -78,17 +78,21 @@ Delete `mod/run/saves/AgentCraft HQ` to start over with a fresh world.
 | Var | Default | Effect |
 |---|---|---|
 | `AGENTCRAFT_DEV_PORT` | 7879 | DevBridge port (always bound to 127.0.0.1) |
-| `AGENTCRAFT_DEV` | 1 | `0` disables the DevBridge |
-| `AGENTCRAFT_MUTE` | 1 | Forces master and music volume to 0 at startup. **Set `0` for real use** (for example in launch.ps1) to keep your own volume |
-| `AGENTCRAFT_FOCUS` | 0 | `0`: the window is shown **without activating it**, so it never steals focus. `1`: normal "come to front" |
-| `AGENTCRAFT_AUTOWORLD` | 1 | `0`: stay on the title screen |
+| `AGENTCRAFT_DEV` | dev run: 1, jar: 0 | `0` disables the DevBridge, `1` enables it |
+| `AGENTCRAFT_MUTE` | dev run: 1, jar: 0 | `1` forces master and music volume to 0 at startup. **Set `0` for real use** (for example in launch.ps1) to keep your own volume |
+| `AGENTCRAFT_FOCUS` | dev run: 0, jar: 1 | `0`: the window is shown **without activating it**, so it never steals focus. `1`: normal "come to front" |
+| `AGENTCRAFT_AUTOWORLD` | dev run: 1, jar: 0 | `1`: create/load the "AgentCraft HQ" world on startup; `0`: stay on the title screen |
 | `AGENTCRAFT_SHOTS_DIR` | `<repo>/artifacts/shots` | Where `dev.screenshot` writes |
 | `AGENTCRAFT_DEV_ALLOW_ORIGIN` | 0 | `1` lets browser pages (which send an Origin header) connect. They are refused by default |
 | `AGENTCRAFT_DEV_TEST` | 0 | `1` registers test-only commands (`dev.test.stall`, which blocks the render thread to simulate a hung game; `dev.test.foremanMessage`). Never set it for real use |
 | `AGENTCRAFT_PORT` | 7878 | Foreman WebSocket port the mod connects to (always 127.0.0.1) |
 | `AGENTCRAFT_FOREMAN` | 1 | `0` disables the Foreman link (the HUD says so) |
 
-The defaults (muted, no focus) suit unattended agent runs. `tools/launch.ps1` should set
+"Dev run" is `gradlew runClient` (`FabricLoader.isDevelopmentEnvironment()`); "jar" is a built jar
+installed in a normal launcher, which is someone's everyday game: there the mod opens no world, keeps
+the volume, takes focus normally and starts no DevBridge unless asked to, and the window pauses on lost
+focus as the player's options say (dev runs force `pauseOnLostFocus = false`).
+The dev-run defaults (muted, no focus) suit unattended agent runs. `tools/launch.ps1` should set
 `AGENTCRAFT_MUTE=0 AGENTCRAFT_FOCUS=1` for real use (when you launch the game yourself; it does
 without `-Dev`). The name the agents call you comes from the Foreman (`--user-name`, see
 foreman/README.md) and reaches the mod in `foreman.status`.
@@ -163,6 +167,7 @@ treated the same, other binary frames get an `ok:false` reply).
 | `dev.anchors` | `prefix?` | The published layout: `{layout, revision, bounds, anchors:{name:{x,y,z,yaw,pitch}}, count}` |
 | `dev.agents.look` | `agent?` | Agent life per agent: `{id, family, awaitingUser, awaitingDecision, needsYou, paused, posture, seated, sit, seat{x,z,top,drop,deskTop}?, bodyYaw, headYaw, headPitch, bubble, particles}`; top level `exclaims` (agents showing the "!"), `card{agent, input}` while an agent card is open (`input` = its message line, null when closed), `textInputActive` (SDL text input on: typed characters are delivered) |
 | `dev.agents.card` | `agent` | Opens the agent card for that agent (like right-clicking it) |
+| `dev.agents.freezeEntityTick` | `on?` (bool) | Skips every agent's entity tick, as Entity Culling's `tickCulling` does for entities out of view (see "Compatibility: entity tick culling"); agents must keep walking through `AgentManager`'s catch-up. Always returns `{on, entityAdvances, catchUpAdvances, moving}` summed over agents: with `on:false`, `catchUpAdvances` must not grow |
 | `dev.agents.fx` | `agent`, `fx` = `confetti`/`puff`/`sparkle`/`say`, `text?`, `to?` | Plays an agent effect now (QA preview; `say` shows a local speech bubble, nothing is sent) |
 | `dev.agents.keys` | `keys` (comma-separated: key names `space return escape back tab left right`, or text typed letter by letter, a-z 0-9 space) | **Test only** (`AGENTCRAFT_DEV_TEST=1`): presses keys as SDL reports a keyboard (SDL events queued for the game window, one key every 3 frames, through Minecraft's SDL event loop; printable keys produce text events only while SDL text input is on). Returns `{pressed, textEvents, screen, input?, textInputActive}`. `tools/agents-typing.mjs` uses it to check the agent card's message line |
 | `dev.test.foremanMessage` | `message:{type, ...}` | **Test only** (`AGENTCRAFT_DEV_TEST=1`): applies a Foreman message to the state model as if received (e.g. `foreman.status` with `auth:"failed"` to see the auth banner) |
@@ -322,6 +327,24 @@ teleports. Rendering: `EntityRenderDispatcherMixin` routes agents to `AgentRende
 player renderer at submit time. Clicks on agents are consumed client-side (never sent to the server,
 which does not know them).
 
+#### Compatibility: entity tick culling (Entity Culling)
+Mods that skip ticking entities the player can't see would freeze agents, because an agent only
+moves when it advances. The best known is Entity Culling (tr7zw), whose `tickCulling` is on by default:
+an agent walking out of view stopped mid-route. So `AgentManager` (END_CLIENT_TICK) offers every agent
+a catch-up advance after the level's entity ticks, with the same per-entity filters as
+`ClientLevel.tickEntities`: not while paused, removed, a passenger or tick-frozen. (It doesn't check
+ticking sections, so an agent in an unloaded section keeps walking.) A per-agent `TickGate` stamps the
+advance with `AgentManager.clock()`, so it runs exactly once per client tick, either from the entity
+tick or from the catch-up, never both. The catch-up calls `setOldPosAndRot()` first, as `commonTick()`
+does, so render interpolation stays right. The only effect that is not caught up is `tickCount` (the
+clock behind `AgentRenderer`'s `timeSeconds`), and only while a culler skips the whole tick, that is,
+while the agent is out of view. No user configuration is needed; Entity Culling is not a dependency and
+is not touched at runtime. (Before this, the workaround was adding `"agentcraft:agent"` to
+`tickCullingWhitelist` in `config/entityculling.json`.)
+To check without the mod, run `dev.agents.freezeEntityTick {on:true}`, make an agent walk (for example
+give it a task so it walks to a desk), and confirm that it still arrives, `entityAdvances` stays flat
+and `catchUpAdvances` grows by about 20 per agent per second.
+
 ### Nameplates: declutter and occlusion (fix round)
 The verifier found plates unreadable whenever agents shared a station (the lounge at every session
 start): a full plate is up to 126 GUI px (3.15 blocks) wide, lounge slots are 1.4 blocks apart, all
@@ -356,7 +379,10 @@ looking away (the verifier measured 1400-1500 before this change).
 `layout.Anchors` holds the published layout (an immutable snapshot, readable from any thread) and
 saves it as `agentcraft-anchors.json` in the world folder; it is loaded again whenever the HQ world
 starts. `/agentcraft hq [builder]` runs an `hq.HqBuilder`, publishes its anchors and moves the world
-spawn to `spawn`. The Phase 2 builder `test` (`hq.TestRoomBuilder`) is a temporary 25x25 walled
+spawn to `spawn`. Because it rewrites terrain and moves the spawn, it only builds in the "AgentCraft HQ"
+world (opt in elsewhere with `-Dagentcraft.hq.anyworld=1` / `AGENTCRAFT_HQ_ANYWORLD=1`) and never in a
+Hardcore world; a Hardcore world is never treated as the HQ world, and the DevBridge refuses every
+request but `dev.help` while one is loaded. The Phase 2 builder `test` (`hq.TestRoomBuilder`) is a temporary 25x25 walled
 room: a desk island with six monitors (north), library shelves and the task wall (west), terminals
 and merge stations (east), a meeting table and the goal atrium (centre), the podium with user spots,
 a per-agent status lamp test bench and the lounge (south, everyone facing north so `cam_agents` sees

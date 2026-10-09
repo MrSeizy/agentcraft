@@ -25,6 +25,8 @@ describe('provider configuration', () => {
       expect(ForemanStatus.parse({ version: '0.1.0', backend, auth: 'ok' }).backend).toBe(backend);
     }
     expect(load(['--backend', 'codex']).codex.leadModel).toBe('');
+    expect(load(['--backend', 'codex']).codex.effort).toBeUndefined();
+    expect(load(['--backend', 'codex']).codex.leadEffort).toBeUndefined();
   });
 
   it('keeps provider settings separate with flags > env > provider config', () => {
@@ -57,6 +59,39 @@ describe('provider configuration', () => {
     expect(load([], { OPENAI_MODEL: 'env-default' }).openai).toMatchObject({ leadModel: 'env-default', workerModel: 'env-default' });
     expect(load(['--worker-model', 'cli-worker'], { OPENAI_MODEL: 'env-default', AGENTCRAFT_LEAD_MODEL: 'env-lead' }).openai)
       .toMatchObject({ leadModel: 'env-lead', workerModel: 'cli-worker' });
+  });
+
+  it('keeps mixed-team Codex models separate while accepting both CLI path names', () => {
+    const mixed = load(['--backend', 'claude', '--worker-engine', 'codex', '--model', 'sonnet', '--codex-path', '/custom/codex']);
+    expect(mixed.claude.workerModel).toBe('sonnet');
+    expect(mixed.codex.workerModel).toBe('');
+    expect(mixed.codex).toMatchObject({ command: '/custom/codex', path: '/custom/codex' });
+    expect(load(['--backend', 'codex', '--model', 'gpt-generic', '--codex-worker-model', 'gpt-specific', '--codex-command', '/other/codex']).codex)
+      .toMatchObject({ leadModel: 'gpt-generic', workerModel: 'gpt-specific', command: '/other/codex', path: '/other/codex' });
+    expect(load([], { AGENTCRAFT_CODEX_PATH: '/env/codex' }).codex.command).toBe('/env/codex');
+  });
+
+  it('does not send Codex backend model or effort flags to a Claude lead', () => {
+    const cfg = load(['--backend', 'codex', '--lead-engine', 'claude', '--model', 'gpt-codex', '--effort', 'xhigh']);
+    expect(cfg.codex).toMatchObject({ leadModel: 'gpt-codex', workerModel: 'gpt-codex', effort: 'xhigh' });
+    expect(cfg.claude).toMatchObject({ leadModel: 'opus', workerModel: 'sonnet', effort: 'medium', leadEffort: 'medium' });
+  });
+
+  it('validates Codex effort for mixed teams as well as Codex profiles', () => {
+    expect(() => load(['--backend', 'claude', '--worker-engine', 'codex', '--codex-effort', 'max'])).toThrow(/Codex effort/);
+    expect(() => load(['--backend', 'claude', '--engines', 'kit=codex', '--codex-lead-effort', 'max'])).toThrow(/Codex effort/);
+  });
+
+  it('preserves shared team settings and read commands in Codex profiles', () => {
+    load([]);
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({
+      backend: 'codex', claude: { workers: ['kit'], ciCommand: 'npm test', leadReadCommands: ['bd show'], maxBudgetUsdPerTurn: 2 },
+      codex: { maxConcurrent: 1 }, openai: { leadModel: 'api-model', workerModel: 'api-model' },
+    }));
+    expect(load([]).codex.maxBudgetUsdPerTurn).toBeUndefined();
+    expect(load([]).codex).toMatchObject({ workers: ['kit'], ciCommand: 'npm test', maxConcurrent: 1, leadReadCommands: ['bd show'], leadModel: '', workerModel: '' });
+    expect(load(['--backend', 'openai']).openai.leadReadCommands).toEqual(['bd show']);
+    expect(load(['--lead-read-commands', 'bd list']).codex.leadReadCommands).toEqual(['bd list']);
   });
 
   it('ignores API dialect settings for other backends', () => {

@@ -42,7 +42,9 @@ it.skipIf(!process.env.AGENTCRAFT_TEST_CODEX)('installed Codex CLI uses only Age
       const group = (body.tools ?? []).find((tool: any) => tool.name === 'mcp__agentcraft');
       const write = names.find((name: string) => name?.endsWith('__Write')) ?? group?.tools?.find((tool: any) => tool.name === 'Write')?.name;
       if (body.tools?.length && !write && phase !== 'lead') throw new Error(`No Write MCP tool: ${names.join(', ')}`);
-      const item = write && (requests.length === 1 || forceWrite)
+      // Steering can replace the first pending request in newer CLIs. Keep requesting the
+      // write until its side effect exists, instead of using a mutable global request count.
+      const item = write && ((phase === 'app-server' && !fs.existsSync(path.join(dir, 'real-cli.txt'))) || forceWrite)
         ? { type: 'function_call', id: 'fc_write', call_id: 'call_write', name: write, ...(group ? { namespace: 'mcp__agentcraft' } : {}), arguments: JSON.stringify({ file_path: 'real-cli.txt', content: 'real CLI, local stub\n' }), status: 'completed' }
         : { type: 'message', id: `msg_${requests.length}`, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Done.', annotations: [] }] };
       if (write) forceWrite = false;
@@ -156,7 +158,8 @@ it.skipIf(!process.env.AGENTCRAFT_TEST_CODEX)('installed Codex CLI uses only Age
     expect(lead.isError).toBe(false);
     const leadTools = requests.filter((_request, index) => requestPhases[index] === 'lead').flatMap(request => request.tools ?? []);
     const leadNames = leadTools.flatMap(tool => tool.tools?.map((nested: any) => nested.name) ?? [tool.name]);
-    expect(leadNames.some(name => ['Write', 'Edit', 'Bash'].some(writeName => name === writeName || name?.endsWith(`__${writeName}`)))).toBe(false);
+    expect(leadNames.some(name => ['Write', 'Edit'].some(writeName => name === writeName || name?.endsWith(`__${writeName}`)))).toBe(false);
+    expect(leadNames.some(name => name === 'Bash' || name?.endsWith('__Bash'))).toBe(true);
     const safeNative = new Set(['update_plan', 'request_user_input', 'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource']);
     for (const [index, request] of requests.entries()) {
       const unexpected = (request.tools ?? []).map((tool: any) => tool.name).filter((name: string) => !safeNative.has(name) && name !== 'mcp__agentcraft' && !name.startsWith('mcp__agentcraft__'));

@@ -46,6 +46,18 @@ describe('shared coding tools', () => {
     expect(fs.readFileSync(path.join(dir, 'private.txt'), 'utf8')).toBe('secret');
   });
 
+  it('lets the lead inspect with Bash while policy prevents writes and tests', async () => {
+    const cwd = setup();
+    fs.writeFileSync(path.join(cwd, 'README.md'), 'read-only inspection\n');
+    const tools = new ToolExecutor(turnRequest(h, cwd, { role: 'lead' }));
+    const read = await tools.call('read', 'Bash', { command: 'cat README.md' });
+    expect(read.isError).toBeUndefined();
+    expect(toolText(read)).toContain('read-only inspection');
+    expect((await tools.call('write', 'Bash', { command: 'echo changed > new.txt' })).isError).toBe(true);
+    expect((await tools.call('test', 'Bash', { command: 'npm test' })).isError).toBe(true);
+    expect(fs.existsSync(path.join(cwd, 'new.txt'))).toBe(false);
+  });
+
   it('kills an in-flight shell command when the turn is stopped', async () => {
     const cwd = setup();
     const r = turnRequest(h, cwd, { canUseTool: async (_name, input) => ({ behavior: 'allow', updatedInput: input }) });

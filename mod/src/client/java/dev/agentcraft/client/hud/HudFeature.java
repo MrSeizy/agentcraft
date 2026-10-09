@@ -7,6 +7,7 @@ import dev.agentcraft.client.dev.DevBridge;
 import dev.agentcraft.client.dev.Fields;
 import dev.agentcraft.client.foreman.Protocol.Notify;
 import dev.agentcraft.client.foreman.Protocol.NotifyLevel;
+import dev.agentcraft.client.ui.GuardedHud;
 import java.util.Locale;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 
@@ -24,9 +25,9 @@ public final class HudFeature {
 
 	public static void init() {
 		Keys.ensureRegistered();
-		HudElementRegistry.addLast(AgentCraft.id("hud/connection"), new ConnectionBanner());
-		HudElementRegistry.addLast(AgentCraft.id("hud/goal"), new GoalBar());
-		HudElementRegistry.addLast(AgentCraft.id("hud/toasts"), new Toasts());
+		HudElementRegistry.addLast(AgentCraft.id("hud/connection"), GuardedHud.of("hud.connection", new ConnectionBanner()));
+		HudElementRegistry.addLast(AgentCraft.id("hud/goal"), GuardedHud.of("hud.goal", new GoalBar()));
+		HudElementRegistry.addLast(AgentCraft.id("hud/toasts"), GuardedHud.of("hud.toasts", new Toasts()));
 		Toasts.init();
 		HudSounds.init();
 		// QA: the vanilla key binds screen, to check the AgentCraft category (dev.screen {open:"keybinds"})

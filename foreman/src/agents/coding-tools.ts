@@ -144,7 +144,11 @@ export function codingTools(r: TurnRequest): AgentTool[] {
       await fs.writeFile(file, original.replace(a.old_string, () => a.new_string), 'utf8');
       return toolResult('File edited.');
     }),
-    defineTool('Bash', 'Run a shell command in your worktree. Risky commands require user approval through AgentCraft. Use for tests and build commands.', {
+  );
+  tools.push(
+    defineTool('Bash', r.role === 'lead'
+      ? 'Inspect the repository with read-only shell commands. Workers make changes and run tests in their own worktrees.'
+      : 'Run a shell command in your worktree. Risky commands require user approval through AgentCraft. Use for tests and build commands.', {
       command: z.string().min(1), timeout_ms: z.number().int().min(1).max(600_000).optional(),
     }, (a, signal) => shellCommand(a.command, r, a.timeout_ms ?? 120_000, signal)),
   );

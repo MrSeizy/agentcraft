@@ -73,3 +73,20 @@ it('team worker grants do not permit the lead to change the checkout', async () 
   lead.abort.abort();
   expect((await run).behavior).toBe('deny');
 });
+
+it('honors declared lead read commands without granting worker use or mutation', async () => {
+  const p = setup();
+  const abort = new AbortController();
+  const turn = { signal: abort.signal, reason: () => undefined };
+  const lead = p.canUseTool('marlow', 'lead', dir, 'project', turn, ['bd show']);
+  expect((await lead('Bash', { command: 'bd show issue-1' }, { signal: abort.signal })).behavior).toBe('allow');
+  expect(h.fm.decisions.open()).toEqual([]);
+  const worker = p.canUseTool('kit', 'worker', dir, 'project', turn, ['bd show']);
+  const runs = [
+    worker('Bash', { command: 'bd show issue-1' }, { signal: abort.signal }),
+    lead('Bash', { command: 'bd show issue-1 > changed.txt' }, { signal: abort.signal }),
+  ];
+  await until(() => h.fm.decisions.open().length === 2);
+  abort.abort();
+  expect((await Promise.all(runs)).map(r => r.behavior)).toEqual(['deny', 'deny']);
+});

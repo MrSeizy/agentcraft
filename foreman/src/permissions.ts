@@ -14,13 +14,14 @@ export class TeamPermissions {
 
   constructor(private fm: Foreman, skillDirs = skillReadDirs()) { this.skillDirs = skillDirs; }
 
-  canUseTool(agentId: string, role: 'lead' | 'worker', cwd: string, repoId: string, turn: TurnHandle): CanUseTool {
+  canUseTool(agentId: string, role: 'lead' | 'worker', cwd: string, repoId: string, turn: TurnHandle, leadReadCommands: string[] = []): CanUseTool {
     return async (toolName, input, opts): Promise<PermissionResult> => {
       // a stopped/paused/cancelled turn runs nothing more, even if its CLI has not exited yet
       if (turn.signal.aborted) return { behavior: 'deny', message: `Your turn was stopped by ${userName()}.`, interrupt: true };
       const classify = () => classifyToolUse(toolName, input, {
         role,
         cwd,
+        leadReadCommands,
         readDirs: [this.fm.memory.dir, ...this.skillDirs],
         alwaysAllow: [...(this.fm.store.data.permissionRules[agentId] ?? []), ...(this.fm.store.data.teamPermissionRules[repoId] ?? [])],
         mcpServer: 'agentcraft',

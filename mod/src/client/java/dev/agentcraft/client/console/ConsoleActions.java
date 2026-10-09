@@ -319,7 +319,7 @@ public final class ConsoleActions {
 		ConsoleLog.add(Tone.INFO, tb.toString().strip());
 		String spend = spendLabel(s);
 		if (spend != null) {
-			ConsoleLog.add(Tone.INFO, "Claude spend so far: " + spend + " (estimated, this profile)");
+			ConsoleLog.add(Tone.INFO, "Claude API spend so far: " + spend + " (estimated, this profile)");
 		}
 		for (Agent a : s.agents().values()) {
 			String st = !a.isActive() ? "off shift" : a.isPaused() ? "paused" : a.state().wire().replace('_', ' ');

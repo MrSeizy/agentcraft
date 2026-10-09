@@ -1,6 +1,7 @@
-// Shared team orchestration. Runtimes supply model access and execute one agent turn.
+// The agent team: a lead and workers doing real work, each turn run by an engine (engine.ts):
+// the Claude Agent SDK or the Codex app-server, chosen per agent (a team can mix them).
 //
-// Each agent processes a queue of jobs, one runtime turn per job:
+// Each agent processes a queue of jobs, one engine turn per job:
 //   plan    lead explores the repo (read-only), writes the plan, creates tasks
 //   work    worker implements a task in its own git worktree
 //   review  lead reviews a finished task (diff + CI) -> request_merge or changes
@@ -19,16 +20,19 @@
 // the worktree busy on Windows and could still write to it) - and the old worktree's work is
 // committed on its branch. The next worker's worktree then starts from that branch.
 import type { ChildProcess } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import type { AgentRuntime, TurnStats } from './runtime.js';
-import { AuthenticationError } from './runtime.js';
-import { TurnReporter } from './stream.js';
 import type { TeamConfig } from '../config.js';
+import type { AgentRuntime } from './runtime.js';
+import { AuthenticationError } from './runtime.js';
+import { RuntimeEngine } from './engine.js';
+import { TeamPermissions } from '../permissions.js';
 import { FOREMAN_VERSION } from '../config.js';
 import { ClientError, type Backend, type Foreman } from '../foreman.js';
 import { withGitSafety } from '../gitsafety.js';
 import { agentGitIdentity } from '../util/git.js';
-import type { Decision, Goal, Task } from '../protocol.js';
+import type { BackendName, Decision, Goal, Task } from '../protocol.js';
 import { MERGE_OPTIONS } from '../protocol.js';
 import type { TestResult } from '../repos.js';
 import { renderDiffText } from '../diff.js';
@@ -36,9 +40,11 @@ import { formatInbox } from '../bus.js';
 import { descendantsOf, killSnapshot, killTree, orphansOf, processTable, type ProcEntry } from '../util/proc.js';
 import { truncate } from '../util/text.js';
 import { leadSystemPrompt, planPrompt, RESUME_PROMPT, reviewPrompt, workerSystemPrompt, workPrompt } from './prompts.js';
-import { buildTeamTools, MCP_SERVER, type ToolHooks, type TurnHandle } from './tools.js';
+import { fetchPulls, githubOrigin, prRefs, pullBriefs, type PullRequest } from '../pulls.js';
+import type { Engine, EngineId, PermissionGate, Role, TurnStats } from './engine.js';
+import { agentTools, type ToolHooks, type TurnHandle } from './tools.js';
+import { modelLabel } from './models.js';
 import { userName } from '../user.js';
-import { TeamPermissions } from '../permissions.js';
 
 type JobKind = 'plan' | 'work' | 'review' | 'followup';
 type AbortReason = 'pause' | 'stop' | 'shutdown' | 'cancel' | 'timeout';
@@ -79,7 +85,7 @@ interface Running {
   abort: AbortController;
   job: Job;
   reason?: AbortReason;
-  /** the agent's CLI process (we spawn it, so we know its pid) */
+  /** the agent's CLI process (the engine spawns it and reports it, so we know its pid) */
   child?: ChildProcess;
   /** settles when runJob is completely done with this turn */
   done?: Promise<void>;
@@ -121,8 +127,32 @@ export function agentEnv(base: NodeJS.ProcessEnv = process.env, who: { agentId?:
   );
 }
 
+/** Which engine runs which agent: the lead's, the workers', and per-agent exceptions. */
+export interface TeamEngines {
+  lead: Engine;
+  worker: Engine;
+  byAgent?: Record<string, Engine>;
+}
+
+export interface TeamOptions {
+  /** the backend name reported to clients ("claude" or "codex": the workers' engine) */
+  name: BackendName;
+  engines: TeamEngines;
+  /** skip the startup auth probe (tests) */
+  skipAuthCheck?: boolean;
+  /** injectable for tests: pull request intake (default: git + gh, see pulls.ts) */
+  pullFetcher?: PullFetcher;
+}
+
+export interface PullFetcher {
+  origin(repoPath: string): Promise<string | undefined>;
+  fetch(repoPath: string, numbers: number[]): Promise<{ pulls: PullRequest[]; errors: string[] }>;
+}
+
+const defaultPullFetcher: PullFetcher = { origin: (p) => githubOrigin(p), fetch: (p, n) => fetchPulls(p, n) };
+
 export class TeamBackend implements Backend {
-  get name() { return this.runtime.name; }
+  readonly name: BackendName;
   private queues = new Map<string, Job[]>();
   private running = new Map<string, Running>();
   private pausedJobs = new Map<string, Job>();
@@ -142,13 +172,22 @@ export class TeamBackend implements Backend {
   /** scheduler retry after an error (backoff) */
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelayMs = 2000;
+  private readonly pullFetcher: PullFetcher;
   private readonly permissions: TeamPermissions;
+  private readonly opts: TeamOptions;
+  /** the model each agent's last turn really ran (shown on its nameplate) */
+  private reportedModels = new Map<string, { engine: EngineId; label: string }>();
 
   constructor(
-    private fm: Foreman,
-    private cfg: TeamConfig,
-    private runtime: AgentRuntime,
+    protected fm: Foreman,
+    protected cfg: TeamConfig,
+    options: TeamOptions | AgentRuntime,
   ) {
+    const runtime = 'run' in options ? new RuntimeEngine(fm, cfg, options) : undefined;
+    const opts: TeamOptions = runtime ? { name: runtime.id, engines: { lead: runtime, worker: runtime } } : options as TeamOptions;
+    this.opts = opts;
+    this.name = opts.name;
+    this.pullFetcher = opts.pullFetcher ?? defaultPullFetcher;
     this.permissions = new TeamPermissions(fm);
     this.hooks = {
       onReview: () => {
@@ -167,6 +206,14 @@ export class TeamBackend implements Backend {
   private get st(): TeamState {
     const b = this.fm.store.data.backend;
     let s = b[this.name] as TeamState | undefined;
+    // Before provider-specific state, upstream teams (including Codex-only teams) persisted
+    // under `claude`. Move that state once; an existing PR Codex state takes precedence.
+    if (!s && this.name === 'codex' && b.claude) {
+      s = b.claude as TeamState;
+      b.codex = s;
+      delete b.claude;
+      this.fm.store.markDirty();
+    }
     if (!s) {
       s = { inflight: {}, ciFixes: {}, stopped: [] };
       b[this.name] = s;
@@ -179,6 +226,41 @@ export class TeamBackend implements Backend {
 
   get team(): string[] {
     return this.cfg.workers.filter((w) => this.fm.agent(w));
+  }
+
+  /** The engine that runs an agent's turns. */
+  engineFor(agentId: string): Engine {
+    const e = this.opts.engines;
+    return e.byAgent?.[agentId] ?? (agentId === LEAD ? e.lead : e.worker);
+  }
+
+  /**
+   * Every agent's nameplate shows its engine and model: the configured model until a turn reports
+   * the real one (onModel). Off-shift agents too: it is what they would run when spawned.
+   */
+  private showEngines(): void {
+    for (const a of this.fm.agents()) {
+      const engine = this.engineFor(a.id);
+      const reported = this.reportedModels.get(a.id);
+      const model = (reported?.engine === engine.id ? reported.label : undefined) ?? modelLabel(engine.model(a.id === LEAD ? 'lead' : 'worker')) ?? engine.label;
+      this.fm.setAgent(a.id, { engine: engine.id, model });
+    }
+  }
+
+  /** Every engine on the team (each is checked at start). */
+  private enginesInUse(): Engine[] {
+    return [...new Set([LEAD, ...this.team].map((id) => this.engineFor(id)))];
+  }
+
+  /** e.g. "Claude (lead opus, workers sonnet)" or "Claude lead opus · Codex workers gpt-5" */
+  private teamLabel(): string {
+    const lead = this.engineFor(LEAD);
+    const workers = [...new Set(this.team.map((w) => this.engineFor(w)))];
+    // aliases as configured ("opus"), full model ids as display names ("claude-opus-5-5" -> "Opus 5.5")
+    const m = (e: Engine, role: Role) => (/^[a-z]+$/.test(e.model(role)) ? e.model(role) : (modelLabel(e.model(role)) ?? e.model(role)));
+    if (!workers.length || (workers.length === 1 && workers[0] === lead)) return `${lead.label} (lead ${m(lead, 'lead')}, workers ${m(lead, 'worker')})`;
+    if (workers.length === 1) return `${lead.label} lead ${m(lead, 'lead')} · ${workers[0]!.label} workers ${m(workers[0]!, 'worker')}`;
+    return `${lead.label} lead ${m(lead, 'lead')} · ${this.team.map((w) => `${this.fm.nameOf(w)} ${this.engineFor(w).label}`).join(', ')}`;
   }
 
   private isStopped(agentId: string): boolean {
@@ -206,7 +288,9 @@ export class TeamBackend implements Backend {
     // the spend survives restarts: every session's cost is persisted, so the total is their sum
     const spent = Object.values(this.fm.store.data.sessions).reduce((sum, s) => sum + (s.costUsd || 0), 0);
     if (spent > 0) this.fm.setStatus({ costUsd: Math.round(spent * 1000) / 1000 });
+    this.showEngines();
     await this.checkAuth();
+    this.showEngines(); // the auth check may have learned the configured model
     if (!this.cfg.resumeOnStart) {
       this.st.inflight = {};
     } else {
@@ -219,16 +303,25 @@ export class TeamBackend implements Backend {
   }
 
   async checkAuth(): Promise<boolean> {
-    this.fm.setStatus({ auth: 'checking', message: `Checking ${this.runtime.label} access...` });
-    try {
-      const account = await this.runtime.checkAuth();
-      this.authFailed = false;
-      this.fm.setStatus({ auth: 'ok', account, message: `${this.runtime.label} (lead ${this.cfg.leadModel || 'default'}, workers ${this.cfg.workerModel || 'default'})` });
+    if (this.opts.skipAuthCheck) {
+      this.fm.setStatus({ auth: 'ok', message: this.teamLabel() });
       return true;
-    } catch (e) {
-      this.markAuthFailed((e as Error).message);
-      return false;
     }
+    const engines = this.enginesInUse();
+    this.fm.setStatus({ auth: 'checking', message: `Checking ${engines.map((e) => e.label).join(' and ')} access...` });
+    const accounts: string[] = [];
+    for (const engine of engines) {
+      const r = await engine.checkAuth().catch((e: Error): { ok: false; message: string } => ({ ok: false, message: `${engine.label} check failed: ${e.message}` }));
+      if (!r.ok) {
+        this.markAuthFailed(r.message);
+        return false;
+      }
+      accounts.push(engines.length > 1 ? `${engine.label}: ${r.account}` : r.account);
+      this.fm.log.info(`${engine.id} auth ok (${r.account})`);
+    }
+    this.authFailed = false;
+    this.fm.setStatus({ auth: 'ok', account: accounts.join(' · '), message: this.teamLabel() });
+    return true;
   }
 
   private markAuthFailed(message: string): void {
@@ -430,7 +523,7 @@ export class TeamBackend implements Backend {
   async submitGoal(goal: Goal): Promise<void> {
     if (this.authFailed) {
       this.fm.setGoal(goal.id, { status: 'failed' });
-      throw new ClientError(`${this.runtime.label} is not available: ${this.fm.status.message ?? 'auth failed'}`);
+      throw new ClientError(`Agent team is not available: ${this.fm.status.message ?? 'auth failed'}`);
     }
     const repo = this.fm.repos.require(goal.repoId!);
     if (this.isStopped(LEAD)) {
@@ -439,7 +532,27 @@ export class TeamBackend implements Backend {
     }
     for (const w of [LEAD, ...this.team]) if (!this.isStopped(w)) this.fm.setAgent(w, { active: true });
     this.fm.setAgent(LEAD, { state: 'thinking', station: 'meeting', activity: 'reading the goal', repoId: repo.id });
-    this.enqueue({ kind: 'plan', agentId: LEAD, goalId: goal.id, sessionKey: `${LEAD}:${goal.id}`, fresh: true, prompt: planPrompt(this.fm, goal, repo.path, repo.branch) });
+    const pulls = await this.intakePulls(goal, repo.path);
+    this.enqueue({ kind: 'plan', agentId: LEAD, goalId: goal.id, sessionKey: `${LEAD}:${goal.id}`, fresh: true, prompt: planPrompt(this.fm, goal, repo.path, repo.branch, pulls) });
+  }
+
+  /**
+   * A goal that mentions pull requests ("#12") on a GitHub repository: fetch them before the lead
+   * plans (see pulls.ts), announce them in the feed and keep a brief in shared memory.
+   */
+  private async intakePulls(goal: Goal, repoPath: string): Promise<PullRequest[]> {
+    const refs = prRefs(goal.text);
+    if (!refs.length || !(await this.pullFetcher.origin(repoPath))) return [];
+    this.fm.setAgent(LEAD, { state: 'reading', station: 'library', activity: `fetching ${refs.length} pull request${refs.length === 1 ? '' : 's'}` });
+    this.fm.bus.feed('system', `Fetching ${refs.length} pull request${refs.length === 1 ? '' : 's'} from GitHub`, { agentId: LEAD });
+    const { pulls, errors } = await this.pullFetcher.fetch(repoPath, refs);
+    for (const p of pulls) this.fm.bus.feed('task', `PR #${p.number} by @${p.author}: ${p.title}`, { agentId: LEAD });
+    for (const e of errors) this.fm.bus.feed('error', `PR ${e}`, { agentId: LEAD });
+    if (pulls.length) {
+      this.fm.memory.write({ scope: 'shared', title: `Pull requests for ${goal.id}`, body: pullBriefs(pulls), author: LEAD, mode: 'replace' });
+    }
+    this.fm.setAgent(LEAD, { state: 'thinking', station: 'meeting', activity: 'reading the goal' });
+    return pulls;
   }
 
   private promoteGoal(goal: Goal, why: string): void {
@@ -521,6 +634,8 @@ export class TeamBackend implements Backend {
         this.fm.bus.feed('task', `${this.fm.nameOf(agentId)} continues ${t.id} from ${this.fm.nameOf(prev.agentId)}'s branch`, { agentId });
       }
     }
+    // a pull request task starts from the contributor's commits (fetched at goal intake)
+    if (!startPoint && t.startBranch) startPoint = t.startBranch;
     const wt = await this.fm.repos.createWorktree(t.repoId!, agentId, t, startPoint ? { startPoint } : {});
     this.fm.tasks.update(t.id, { branch: wt.branch, worktree: wt.id });
     this.fm.tasks.setStatus(t.id, 'doing');
@@ -560,10 +675,6 @@ export class TeamBackend implements Backend {
     }
   }
 
-  private env(who: { agentId?: string; cwd?: string } = {}): Record<string, string | undefined> {
-    return this.runtime.env?.(agentEnv(process.env, who)) ?? agentEnv(process.env, who);
-  }
-
   private cwdFor(job: Job): { cwd: string; role: 'lead' | 'worker'; repoId: string } {
     if (job.agentId === LEAD) {
       const goal = job.goalId ? this.fm.goal(job.goalId) : this.fm.currentGoal();
@@ -576,6 +687,45 @@ export class TeamBackend implements Backend {
     return { cwd: this.fm.repos.requireWorktree(t.repoId, t.worktree).path, role: 'worker', repoId: t.repoId };
   }
 
+  /** Both native engines and provider runtimes share repository-scoped team permissions. */
+  private permissionGate(agentId: string, role: Role, cwd: string, repoId: string, turn: TurnHandle): PermissionGate {
+    const gate = this.permissions.canUseTool(agentId, role, cwd, repoId, turn, this.cfg.leadReadCommands);
+    return async (name, input, signal, title) => {
+      const result = await gate(name, input, { signal, ...(title ? { title } : {}) });
+      return result.behavior === 'allow' ? { allow: true } : { allow: false, message: result.message, ...(result.interrupt ? { interrupt: true } : {}) };
+    };
+  }
+
+  /**
+   * Where a sandboxed worker (Codex) may write besides its worktree: exactly what committing and
+   * merging on its own branch needs, and the temp dir (scratch files and test runs; the policy
+   * allows it too). Never the shared git dir as a whole: its config and hooks would let a worker
+   * run code in the user's own git, outside every sandbox, and its refs would let it move the
+   * user's branches. Verified against the real Codex Windows sandbox: commit and `git merge`
+   * work; writing .git/config, .git/hooks or refs/heads/main is denied.
+   *  - objects/                        new commits, trees, blobs (content-addressed, harmless)
+   *  - refs/heads/<branch dir>/        this agent's branches only (agentcraft/<agent>/...)
+   *  - logs/refs/heads/<branch dir>/   their reflogs
+   *  - the worktree's own git dir      its HEAD, index, ORIG_HEAD, MERGE_HEAD (Codex protects the
+   *                                    .git pointer's target unless it is granted exactly)
+   */
+  private async writableRoots(role: Role, job: Job): Promise<string[]> {
+    if (role !== 'worker' || !job.taskId) return [];
+    const t = this.fm.tasks.require(job.taskId);
+    const repo = this.fm.repos.require(t.repoId!);
+    const worktree = this.fm.repos.requireWorktree(repo.id, t.worktree!);
+    const verified = await this.fm.repos.verifyWorktreeGit(repo, worktree);
+    if (!verified.ok) throw new Error(`Cannot grant worktree Git access: ${verified.reason}`);
+    const roots = [path.join(verified.commonDir, 'objects'), verified.gitDir, os.tmpdir()];
+    const branchDir = path.posix.dirname(worktree.branch);
+    if (branchDir !== '.' && !branchDir.split('/').includes('..')) {
+      for (const d of [path.join(verified.commonDir, 'refs', 'heads', ...branchDir.split('/')), path.join(verified.commonDir, 'logs', 'refs', 'heads', ...branchDir.split('/'))]) {
+        fs.mkdirSync(d, { recursive: true });
+        roots.push(d);
+      }
+    }
+    return [...new Set(roots)];
+  }
 
   private async runJob(job: Job): Promise<void> {
     const agentId = job.agentId;
@@ -594,8 +744,10 @@ export class TeamBackend implements Backend {
       const where = this.cwdFor(job);
       cwd = where.cwd;
       const role = where.role;
+      const engine = this.engineFor(agentId);
       const session = this.fm.store.data.sessions[job.sessionKey];
-      const resume = !job.fresh && (session?.provider === this.name || (!session?.provider && this.name === 'claude')) && session?.sessionId ? session.sessionId : undefined;
+      // a session belongs to the engine that made it (records from before engines were Claude's)
+      const resume = !job.fresh && session?.sessionId && (session.engine ?? session.provider ?? 'claude') === engine.id ? session.sessionId : undefined;
       this.st.inflight[agentId] = { kind: job.kind, sessionKey: job.sessionKey, startedAt: Date.now(), ...(job.taskId ? { taskId: job.taskId } : {}), ...(job.goalId ? { goalId: job.goalId } : {}) };
       this.fm.store.markDirty();
 
@@ -605,47 +757,59 @@ export class TeamBackend implements Backend {
         const t = this.fm.tasks.require(job.taskId!);
         systemAppend = workerSystemPrompt(this.fm, agentId, this.fm.repos.requireWorktree(t.repoId!, t.worktree!));
       }
-      const model = role === 'lead' ? this.cfg.leadModel : this.cfg.workerModel;
-      this.fm.agentLog(agentId, 'text', `${resume ? 'Resuming' : 'Starting'} ${job.kind}${job.taskId ? ` ${job.taskId}` : ''} (${model})`);
+      const model = engine.model(role);
+      this.fm.agentLog(agentId, 'text', `${resume ? 'Resuming' : 'Starting'} ${job.kind}${job.taskId ? ` ${job.taskId}` : ''} (${engine.id === 'claude' ? model : `${engine.label} ${model}`})`);
       if (job.kind === 'followup' || job.resumed) this.fm.agentLog(agentId, 'text', truncate(job.prompt, 400));
-      const mapper = new TurnReporter(this.fm, agentId, cwd, role);
       const timer = setTimeout(() => this.abortTurn(entry, 'timeout'), TURN_TIMEOUT_MS);
       timer.unref?.();
       // messages that arrived while the agent was not in a turn ride along with this prompt
       const unread = this.fm.bus.inbox(agentId, { markRead: true });
       const prompt = unread.length ? `${job.prompt}\n\n[New messages]\n${formatInbox(unread, (id) => this.fm.nameOf(id))}` : job.prompt;
       try {
-        stats = await this.runtime.run({
-          agentId, prompt, systemPrompt: systemAppend, cwd, role, model,
-          effort: role === 'lead' ? this.cfg.leadEffort : this.cfg.effort,
-          maxTurns: role === 'lead' ? this.cfg.maxTurnsLead : this.cfg.maxTurnsWorker,
-          maxBudgetUsd: this.cfg.maxBudgetUsdPerTurn,
-          resume, abortController: abort, env: this.env({ agentId, cwd }),
-          tools: buildTeamTools(this.fm, agentId, role, this.hooks, turn),
-          canUseTool: this.permissions.canUseTool(agentId, role, cwd, where.repoId, turn),
-          reporter: mapper,
-          onSession: (id) => this.recordSession(job.sessionKey, id, model),
-          onSpawn: (child) => {
+        stats = await engine.runTurn({
+          agentId,
+          role,
+          cwd,
+          prompt,
+          instructions: systemAppend,
+          ...(resume ? { resume } : {}),
+          env: agentEnv(process.env, { agentId, cwd }),
+          writableRoots: await this.writableRoots(role, job),
+          abort,
+          turn,
+          permission: this.permissionGate(agentId, role, cwd, where.repoId, turn),
+          tools: agentTools(this.fm, agentId, role, this.hooks, turn),
+          // a stopped turn's whole process tree is ended before its worktree is handed on
+          onProcess: (child) => {
             entry.child = child;
             entry.spawnedAt = Date.now();
+          },
+          onSession: (id) => {
+            if (this.fm.store.data.sessions[job.sessionKey]?.sessionId !== id) this.recordSession(job.sessionKey, id, model, engine.id);
           },
           onSteerReady: steer => {
             entry.steer = steer;
             this.steerPending(agentId, entry);
           },
+          onModel: (m) => {
+            const label = modelLabel(m);
+            if (!label) return;
+            this.reportedModels.set(agentId, { engine: engine.id, label });
+            this.fm.setAgent(agentId, { engine: engine.id, model: label });
+          },
         });
       } finally {
         clearTimeout(timer);
       }
-      if (stats?.sessionId) this.recordSession(job.sessionKey, stats.sessionId, model, stats);
-      if (stats?.authFailed) this.markAuthFailed(`${this.runtime.label} authentication failed (${stats.authFailed}). Check provider credentials and restart the Foreman.`);
+      if (stats.sessionId) this.recordSession(job.sessionKey, stats.sessionId, model, engine.id, stats);
+      if (stats.authFailed) this.markAuthFailed(engine.authFailedMessage(stats.authFailed));
     } catch (e) {
       const aborted = abort.signal.aborted;
       if (!aborted) {
         const msg = (e as Error).message ?? String(e);
         this.fm.log.error(`${agentId} ${job.kind} failed: ${msg}`);
         this.fm.agentLog(agentId, 'error', `session error: ${truncate(msg, 400)}`);
-        if (e instanceof AuthenticationError) this.markAuthFailed(`${this.runtime.label} authentication failed: ${truncate(msg, 160)}`);
+        if (e instanceof AuthenticationError) this.markAuthFailed(this.engineFor(agentId).authFailedMessage(truncate(msg, 160)));
         stats = { isError: true, errors: [msg] };
       }
     } finally {
@@ -699,11 +863,12 @@ export class TeamBackend implements Backend {
     this.onUserMessage(agentId, fromUser[fromUser.length - 1]!.text);
   }
 
-  private recordSession(key: string, sessionId: string, model: string, stats?: TurnStats): void {
+  private recordSession(key: string, sessionId: string, model: string, engine: EngineId, stats?: TurnStats): void {
     const s = (this.fm.store.data.sessions[key] ??= { turns: 0, costUsd: 0, updatedAt: Date.now() });
     s.sessionId = sessionId;
-    s.provider = this.name;
     s.model = model;
+    s.engine = engine;
+    s.provider = engine;
     s.updatedAt = Date.now();
     if (stats) {
       s.turns += stats.numTurns ?? 0;

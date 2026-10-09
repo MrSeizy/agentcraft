@@ -1,4 +1,6 @@
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import spawn from 'cross-spawn';
@@ -11,6 +13,7 @@ import { isAuthenticationMessage } from '../runtime.js';
 import { ToolExecutor } from '../coding-tools.js';
 import { startBridge } from './bridge.js';
 import { AppServerTransport, object, type RpcObject } from './transport.js';
+import { findCodex } from './find.js';
 
 export type CodexSpawn = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
 const defaultSpawn: CodexSpawn = (command, args, options) => spawn(command, args, options);
@@ -56,7 +59,7 @@ export function threadConfig(config: RpcObject, r: TurnRequest, url: string): Rp
     'sandbox_workspace_write.network_access': false,
     'sandbox_workspace_write.exclude_tmpdir_env_var': true,
     'sandbox_workspace_write.exclude_slash_tmp': true,
-    model_reasoning_effort: r.effort,
+    ...(r.effort ? { model_reasoning_effort: r.effort } : {}),
     // CODEX_API_KEY is an exec-mode convenience. Use an env-backed provider in app-server
     // without logging in or writing the key to the user's authentication/config files.
     ...(r.env.CODEX_API_KEY ? {
@@ -112,20 +115,68 @@ async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<void
 export class CodexRuntime implements AgentRuntime {
   readonly name = 'codex' as const;
   readonly label = 'Codex';
-  constructor(private cfg: CodexConfig, private spawnFn: CodexSpawn = defaultSpawn) {}
+  private configuredModel: string | undefined;
+  constructor(private cfg: CodexConfig, private spawnFn: CodexSpawn = defaultSpawn, private dataDir?: string) {}
+
+  model(): string | undefined { return this.configuredModel; }
+
+  private command(): string {
+    // Preserve injected transports, while resolving npm launchers and desktop-bundled CLIs.
+    if (this.spawnFn !== defaultSpawn) return this.cfg.command;
+    const explicit = this.cfg.command === 'codex' ? this.cfg.path : this.cfg.command;
+    return findCodex(explicit) ?? this.cfg.command;
+  }
+
+  private serverEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    if (process.platform !== 'win32') return env;
+    // Keep sandbox ACL setup away from executables held open by the desktop app. The MCP
+    // bridge uses the original tool environment, including the user's LOCALAPPDATA.
+    const localAppData = path.join(this.dataDir ?? os.tmpdir(), 'codex-localappdata');
+    fs.mkdirSync(localAppData, { recursive: true });
+    const isolated = { ...env };
+    for (const key of Object.keys(isolated)) if (key.toUpperCase() === 'LOCALAPPDATA') delete isolated[key];
+    isolated.LOCALAPPDATA = localAppData;
+    return isolated;
+  }
 
   async checkAuth(): Promise<string> {
     try {
-      if (await probe(this.cfg.command, ['--version'], this.spawnFn) !== 0) throw new Error('version check failed');
+      if (await probe(this.command(), ['--version'], this.spawnFn) !== 0) throw new Error('version check failed');
     } catch (e) {
       throw new Error(`Codex CLI unavailable: ${(e as Error).message}. Install @openai/codex or set --codex-command.`);
     }
-    if (await probe(this.cfg.command, ['app-server', '--help'], this.spawnFn) !== 0) {
+    if (await probe(this.command(), ['app-server', '--help'], this.spawnFn) !== 0) {
       throw new Error('Codex CLI does not support app-server. Update Codex or set --codex-command to a compatible CLI.');
     }
     if (process.env.CODEX_API_KEY) return 'CODEX_API_KEY';
-    if (await probe(this.cfg.command, ['login', 'status'], this.spawnFn) !== 0) throw new Error('Codex is not logged in. Run `codex login`, or set CODEX_API_KEY, then restart the Foreman.');
-    return 'Codex CLI login';
+    const child = this.spawnFn(this.command(), codexArgs(), {
+      cwd: os.homedir(), env: this.serverEnv(process.env), stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true, detached: process.platform !== 'win32',
+    });
+    const rpc = new AppServerTransport(child);
+    // Drain diagnostics without exposing credential-bearing user configuration.
+    child.stderr?.resume();
+    try {
+      await rpc.request('initialize', { clientInfo: { name: 'agentcraft_foreman', title: 'AgentCraft Foreman', version: FOREMAN_VERSION }, capabilities: { experimentalApi: false, requestAttestation: false } });
+      rpc.notify('initialized');
+      const read = await rpc.request('config/read', { includeLayers: false });
+      if (object(read.config) && typeof read.config.model === 'string' && read.config.model) this.configuredModel = read.config.model;
+      const auth = await rpc.request('account/read', {});
+      if (!object(auth.account)) {
+        if (auth.requiresOpenaiAuth === false) return 'Codex configured provider';
+        throw new Error('Codex is not logged in. Run `codex login`, or set CODEX_API_KEY, then restart the Foreman.');
+      }
+      const account = auth.account;
+      return account.type === 'chatgpt' ? `Codex CLI login${typeof account.planType === 'string' ? ` · ChatGPT ${account.planType}` : ''}`
+        : account.type === 'apiKey' ? 'OpenAI API key' : account.type === 'amazonBedrock' ? 'Amazon Bedrock' : 'Codex configured provider';
+    } finally {
+      rpc.close();
+      await waitForExit(child, 500);
+      killTree(child);
+      await waitForExit(child, 1000);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }
   }
 
   async run(r: TurnRequest): Promise<TurnStats> {
@@ -159,6 +210,8 @@ export class CodexRuntime implements AgentRuntime {
       return result;
     };
     let resultText = '';
+    let tokens = 0;
+    let threadTokensAtStart: number | undefined;
     let providerError: string | undefined;
     let stderr = '';
     const deliveries = new Map<string, (consumed: boolean) => void>();
@@ -195,8 +248,8 @@ export class CodexRuntime implements AgentRuntime {
     };
     try {
       signal.throwIfAborted();
-      child = this.spawnFn(this.cfg.command, codexArgs(), {
-        cwd: r.cwd, env: { ...r.env, AGENTCRAFT_MCP_TOKEN: bridge.token },
+      child = this.spawnFn(this.command(), codexArgs(), {
+        cwd: r.cwd, env: this.serverEnv({ ...r.env, AGENTCRAFT_MCP_TOKEN: bridge.token }),
         stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: process.platform !== 'win32',
       });
       rpc = new AppServerTransport(child);
@@ -212,7 +265,21 @@ export class CodexRuntime implements AgentRuntime {
       r.onSpawn(child);
       signal.addEventListener('abort', onAbort, { once: true });
       if (signal.aborted) onAbort();
-      rpc.onRequest = method => {
+      rpc.onRequest = (method, params) => {
+        if (method === 'item/tool/call') {
+          const reply = (text: string, success = false) => ({ success, contentItems: [{ type: 'inputText', text }] });
+          // Upstream app-server sessions persist their dynamic team tools. Resume cannot
+          // remove them, so route only current-role aliases through the current bridge.
+          if (!r.resume || !threadId || params.threadId !== threadId || !turnId || params.turnId !== turnId
+            || terminal || signal.aborted) return reply('This tool call is not part of the active turn.');
+          if (typeof params.tool !== 'string' || !r.tools.some(tool => tool.name === params.tool)) {
+            return reply('This legacy tool is unavailable for your role. Use the current AgentCraft MCP tools.');
+          }
+          if (!object(params.arguments)) return reply('Invalid tool arguments: expected an object.');
+          return bridge.call(params.tool, params.arguments, signal).then(result => ({
+            success: !result.isError, contentItems: result.content.map(content => ({ type: 'inputText', text: content.text })),
+          }));
+        }
         // All coding and questions go through our MCP policy, never native approval escalation.
         if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') return { decision: 'decline' };
         if (method === 'item/permissions/requestApproval') return { permissions: {}, scope: 'turn' };
@@ -229,6 +296,18 @@ export class CodexRuntime implements AgentRuntime {
           return;
         }
         if (terminal) return;
+        if (method === 'thread/tokenUsage/updated' && (!params.turnId || params.turnId === turnId) && object(params.tokenUsage)) {
+          // `total` is cumulative across a resumed thread; subtract the baseline from the
+          // first update and use `last` once. Repeated notifications must not inflate usage.
+          const usage = params.tokenUsage;
+          const total = object(usage.total) ? usage.total.totalTokens : undefined;
+          const last = object(usage.last) ? usage.last.totalTokens : undefined;
+          if (typeof total === 'number' && typeof last === 'number') {
+            threadTokensAtStart ??= Math.max(0, total - last);
+            tokens = Math.max(tokens, total - threadTokensAtStart);
+          } else if (typeof last === 'number') tokens = Math.max(tokens, last);
+          return;
+        }
         if (method === 'turn/started' && object(params.turn) && typeof params.turn.id === 'string') {
           if (turnId && turnId !== params.turn.id) throw new Error('Unexpected Codex turn');
           turnId = params.turn.id;
@@ -258,6 +337,7 @@ export class CodexRuntime implements AgentRuntime {
       rpc.notify('initialized');
       const read = await request('config/read', { cwd: r.cwd, includeLayers: false });
       if (!object(read.config)) throw new Error('Codex returned no effective configuration');
+      if (typeof read.config.model === 'string' && read.config.model) this.configuredModel = read.config.model;
       if (object(read.config.model_providers)) for (const provider of Object.values(read.config.model_providers)) {
         if (object(provider) && typeof provider.env_key === 'string') {
           const key = r.env[provider.env_key];
@@ -265,7 +345,7 @@ export class CodexRuntime implements AgentRuntime {
           delete toolEnv[provider.env_key];
         }
       }
-      const coding = r.role === 'lead' ? 'Read, Glob, Grep' : 'Read, Glob, Grep, Edit, Write, Bash';
+      const coding = r.role === 'lead' ? 'Read, Glob, Grep, Bash (read-only)' : 'Read, Glob, Grep, Edit, Write, Bash';
       const permissions = r.role === 'lead' ? 'You are read-only; assign changes and dependency setup to workers.'
         : 'Edit files and run commands through AgentCraft Edit, Write and Bash. Attempt missing dependency installs through Bash; AgentCraft asks the user when approval is needed.';
       const instructions = `${r.systemPrompt}\n\nUse the agentcraft MCP tools for ALL repository operations (${coding}) and team coordination. ${permissions} Ask questions only through agentcraft ask_user. Native shell, image, goal, subagent, and web tools are disabled.`;
@@ -276,11 +356,14 @@ export class CodexRuntime implements AgentRuntime {
         ...(r.model ? { model: r.model } : {}),
       });
       threadId = verifyThread(thread, r);
+      const model = typeof thread.model === 'string' && thread.model ? thread.model : r.model || this.configuredModel;
+      if (model) r.onModel?.(model);
       r.reporter.session(threadId);
       r.onSession(threadId);
       const begun = await request('turn/start', {
         threadId, input: [{ type: 'text', text: r.prompt, text_elements: [] }], cwd: r.cwd,
-        approvalPolicy: 'never', approvalsReviewer: 'user', sandboxPolicy: sandboxPolicy(r), effort: r.effort,
+        approvalPolicy: 'never', approvalsReviewer: 'user', sandboxPolicy: sandboxPolicy(r),
+        ...(r.effort ? { effort: r.effort } : {}),
         ...(r.model ? { model: r.model } : {}),
       });
       if (!object(begun.turn) || typeof begun.turn.id !== 'string' || !begun.turn.id) throw new Error('Codex returned no turn ID');
@@ -309,7 +392,7 @@ export class CodexRuntime implements AgentRuntime {
         : failure ? [redact(failure)] : outcome?.status === 'failed' ? ['Codex turn failed'] : [];
       flushText(true);
       return r.reporter.complete({ isError: limitReached || signal.aborted || outcome?.status !== 'completed', errors,
-        resultText: redact(resultText), numTurns: 1,
+        resultText: redact(resultText), numTurns: 1, tokens,
         subtype: limitReached ? 'error_max_turns' : signal.aborted ? 'interrupted' : String(outcome?.status === 'completed' ? 'success' : outcome?.status ?? 'error'),
         ...(!signal.aborted && outcome?.status === 'failed' && failure && isAuthenticationMessage(failure) ? { authFailed: 'Check Codex CLI authentication' } : {}),
       });
@@ -340,5 +423,5 @@ export class CodexRuntime implements AgentRuntime {
 }
 
 export class CodexBackend extends TeamBackend {
-  constructor(fm: Foreman, cfg: CodexConfig, spawnFn?: CodexSpawn) { super(fm, cfg, new CodexRuntime(cfg, spawnFn)); }
+  constructor(fm: Foreman, cfg: CodexConfig, spawnFn?: CodexSpawn) { super(fm, cfg, new CodexRuntime(cfg, spawnFn, fm.config.dataDir)); }
 }

@@ -80,6 +80,8 @@ function diffFromInput(tool: string, input: Record<string, unknown>, cwd: string
 export class StreamMapper {
   private toolNames = new Map<string, string>();
   readonly stats: TurnStats = { isError: false, errors: [] };
+  /** the model the CLI reported at init */
+  model: string | undefined;
 
   constructor(
     private fm: Foreman,
@@ -96,6 +98,7 @@ export class StreamMapper {
         const m = msg as { subtype?: string; session_id?: string; model?: string };
         if (m.subtype === 'init' && m.session_id) {
           this.stats.sessionId = m.session_id;
+          if (m.model) this.model = m.model;
           fm.log.debug(`${id}: session ${m.session_id} (${m.model ?? '?'})`);
         }
         break;

@@ -13,6 +13,7 @@ import dev.agentcraft.client.foreman.ForemanState;
 import dev.agentcraft.client.foreman.Protocol.Agent;
 import dev.agentcraft.client.foreman.Protocol.Task;
 import dev.agentcraft.client.foreman.Protocol.TaskStatus;
+import dev.agentcraft.client.ui.Guard;
 import dev.agentcraft.client.world.StationInteractions;
 import dev.agentcraft.client.world.StationRenderer;
 import java.util.HashMap;
@@ -80,7 +81,7 @@ public final class TaskWallFeature {
 				}
 			}
 		});
-		ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+		ClientTickEvents.END_CLIENT_TICK.register(mc -> Guard.run("taskwall.sweep", () -> {
 			if (mc.level == null || (mc.level.getGameTime() % 200) != 0) {
 				return;
 			}
@@ -91,9 +92,9 @@ public final class TaskWallFeature {
 					it.remove();
 				}
 			}
-		});
+		}));
 		// the brass card outline replaces vanilla's black block box while a card is under the crosshair
-		LevelRenderEvents.BEFORE_BLOCK_OUTLINE.register((ctx, outline) -> !cardUnderCrosshair(outline.pos()));
+		LevelRenderEvents.BEFORE_BLOCK_OUTLINE.register((ctx, outline) -> Guard.call("taskwall.outline", () -> !cardUnderCrosshair(outline.pos()), true));
 		StationInteractions.onUse(ModBlocks.TASK_BOARD, (player, pos, state, be) -> {
 			Minecraft mc = Minecraft.getInstance();
 			HitResult hr = mc.hitResult;

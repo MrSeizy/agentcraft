@@ -20,16 +20,17 @@ export async function startBridge(r: TurnRequest, onLimit: () => void) {
   // fresh server per POST loses the original request controller and leaves the tool running.
   const mcp = new McpServer({ name: 'agentcraft', version: '0.1.0' });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true });
-  for (const tool of executor.tools) {
-    mcp.registerTool(tool.name, { description: tool.description, inputSchema: tool.inputSchema }, async (args, extra) => {
-      const result = tail.then(async () => {
-        if (closed || r.abortController.signal.aborted || extra.signal.aborted) return toolResult('Tool request stopped.', true);
-        if (++calls > r.maxTurns) { onLimit(); return toolResult('Tool call limit reached.', true); }
-        return executor.call(randomUUID(), tool.name, args, extra.signal);
-      });
-      tail = result.then(() => undefined, () => undefined);
-      return result;
+  const call = (name: string, args: Record<string, unknown>, signal: AbortSignal) => {
+    const result = tail.then(async () => {
+      if (closed || r.abortController.signal.aborted || signal.aborted) return toolResult('Tool request stopped.', true);
+      if (++calls > r.maxTurns) { onLimit(); return toolResult('Tool call limit reached.', true); }
+      return executor.call(randomUUID(), name, args, signal);
     });
+    tail = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  for (const tool of executor.tools) {
+    mcp.registerTool(tool.name, { description: tool.description, inputSchema: tool.inputSchema }, (args, extra) => call(tool.name, args, extra.signal));
   }
   await mcp.connect(transport);
   const server = createServer(async (req, res) => {
@@ -60,6 +61,8 @@ export async function startBridge(r: TurnRequest, onLimit: () => void) {
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`, token,
     get calls() { return calls; },
+    /** Legacy dynamic team aliases share the same queue, policy, budget and cleanup. */
+    call,
     async close() {
       closed = true;
       // Abort wakes permission/questions and kills shells. Drain tool work before the

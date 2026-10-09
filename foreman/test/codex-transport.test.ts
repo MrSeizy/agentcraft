@@ -34,6 +34,25 @@ describe('Codex app-server transport', () => {
     expect(notifications).toEqual(['progress']);
   });
 
+  it('awaits async server requests without serializing notifications and translates handler failures', async () => {
+    const { rpc, sent, receive } = connection();
+    let resolve!: (value: unknown) => void;
+    rpc.onRequest = () => new Promise(done => { resolve = done; });
+    const notifications: string[] = [];
+    rpc.onNotification = method => { notifications.push(method); };
+    receive({ id: 20, method: 'item/tool/call', params: {} });
+    receive({ method: 'progress', params: {} });
+    expect(notifications).toEqual(['progress']);
+    expect(sent).toEqual([]);
+    resolve({ success: true });
+    await Promise.resolve();
+    expect(sent.at(-1)).toEqual({ id: 20, result: { success: true } });
+    rpc.onRequest = async () => { throw new RpcError(-32602, 'bad arguments'); };
+    receive({ id: 21, method: 'item/tool/call', params: {} });
+    await Promise.resolve();
+    expect(sent.at(-1)).toEqual({ id: 21, error: { code: -32602, message: 'bad arguments' } });
+  });
+
   it('returns an RPC rejection without corrupting the connection', async () => {
     const { rpc, receive } = connection();
     const rejected = rpc.request('turn/steer', {}).catch(error => error);

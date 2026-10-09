@@ -1,15 +1,16 @@
 # tools/
 
-## macOS
+## macOS and Linux
 
-Requires Node 22+, git, and Java 25. Install Java with `brew install openjdk@25`;
-`mac.mjs` uses Homebrew's JDK directly, so no system Java changes are needed.
+Requires Node 22+, git, and Java 25. On macOS install Java with `brew install openjdk@25`; on
+Linux install your distribution's Java 25 JDK (Arch: `pacman -S jdk25-openjdk`) or set
+`JAVA_HOME` to one. `unix.mjs` uses that JDK directly, so no system Java changes are needed.
 
 ```sh
-node tools/mac.mjs launch --backend sim             # free simulated team
-node tools/mac.mjs stop --profile sim
-node tools/mac.mjs launch --repo /path/to/repo --use-claude-login
-node tools/mac.mjs stop                            # save/quit game, stop Foreman
+node tools/unix.mjs launch --backend sim            # free simulated team
+node tools/unix.mjs stop --profile sim
+node tools/unix.mjs launch --repo /path/to/repo --use-claude-login
+node tools/unix.mjs stop                           # save/quit game, stop Foreman
 ```
 
 The launcher installs npm dependencies on first use, runs the Fabric development client,
@@ -17,9 +18,24 @@ and waits for the studio world. It reuses a running Foreman or game from the sam
 Use `--dev` for mute/no focus/no notifications; `--no-game` or `--no-foreman` to run just
 one component; `--no-wait` to return immediately while Minecraft builds. Repeat
 `--foreman-arg VALUE` to pass extra Foreman options. Logs and process records live in
-`artifacts/logs/mac-*.log` and `artifacts/run/mac-*.json`. `stop` only signals processes
-recorded by this launcher. macOS uses Notification Center for agent decisions.
-The screenshot QA command, `node tools/qa.mjs`, also uses this launcher on macOS.
+`artifacts/logs/unix-*.log` and `artifacts/run/unix-*.json`. `stop` only signals processes
+recorded by this launcher. Agent decisions show a desktop notification (Notification Center on
+macOS, `notify-send` on Linux). The screenshot QA command, `node tools/qa.mjs`, also uses this
+launcher on macOS and Linux.
+
+### Your own launcher instance (Prism, MultiMC, ...)
+
+The mod also runs in a normal Fabric instance for Minecraft 26.3 with Fabric Loader 0.19.5+:
+
+1. Build the mod: `JAVA_HOME=<Java 25 JDK> sh mod/gradlew -p mod build`, then copy
+   `mod/build/libs/agentcraft-<version>.jar` and Fabric API (`fabric_api_version` in
+   `mod/gradle.properties`) into the instance's `mods/` folder.
+2. Set the instance's environment variables `AGENTCRAFT_MUTE=0` (otherwise the mod forces your
+   master and music volume to 0) and `AGENTCRAFT_FOCUS=1`. See mod/DEV.md for the rest.
+3. Start only the Foreman: `node tools/unix.mjs launch --no-game --backend sim` (or `--repo ...`).
+4. Launch the instance. The title screen loads (or creates) the `AgentCraft HQ` world.
+
+`node tools/devcli.mjs state` reports the running game either way while the DevBridge is on.
 
 ## Windows
 
@@ -114,8 +130,8 @@ or forwarded to Foreman. Set `AGENTCRAFT_API_KEY` in your shell if the endpoint 
 then select it with `--api-key-env` to keep AgentCraft's credentials separate from other API tools:
 
 ```sh
-node tools/mac.mjs launch --backend codex --repo /path/to/repo
-node tools/mac.mjs launch --backend openai --repo /path/to/repo \
+node tools/unix.mjs launch --backend codex --repo /path/to/repo
+node tools/unix.mjs launch --backend openai --repo /path/to/repo \
   --foreman-arg --model --foreman-arg your-model-id \
   --foreman-arg --base-url --foreman-arg http://localhost:1234/v1 \
   --foreman-arg --api-key-env --foreman-arg AGENTCRAFT_API_KEY

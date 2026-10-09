@@ -4,7 +4,8 @@ import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-if (process.argv.includes('--version') || process.argv.includes('--help') || process.argv.includes('login')) process.exit(0);
+if (process.argv.includes('login')) process.exit(process.env.AGENTCRAFT_TEST_NO_OPENAI_AUTH ? 1 : 0);
+if (process.argv.includes('--version') || process.argv.includes('--help')) process.exit(0);
 if (process.env.AGENTCRAFT_TEST_STARTUP_ERROR) {
   process.stderr.write(`startup configuration rejected: ${process.env.AGENTCRAFT_TEST_STARTUP_ERROR}\n`);
   process.exit(1);
@@ -16,6 +17,12 @@ let client;
 let active;
 let prompt = '';
 let completed = false;
+let nextServerId = 1000;
+const pendingServerRequests = new Map();
+const requestTool = params => new Promise(resolve => {
+  const id = nextServerId++; pendingServerRequests.set(id, resolve);
+  emit({ id, method: 'item/tool/call', params });
+});
 const trace = message => {
   if (process.env.AGENTCRAFT_TEST_TRACE) fs.appendFileSync(process.env.AGENTCRAFT_TEST_TRACE, JSON.stringify(message) + '\n');
 };
@@ -28,6 +35,17 @@ const text = (value = 'Finished via AgentCraft MCP.') => {
   notify('item/completed', { threadId, turnId, item: { id: 'msg-final', type: 'agentMessage', phase: 'final_answer', text: value } });
 };
 async function work() {
+  if (prompt.includes('[legacy-tool]')) {
+    const result = await requestTool({ threadId: prompt.includes('[foreign]') ? 'foreign' : threadId,
+      turnId: prompt.includes('[stale]') ? 'stale' : turnId, tool: prompt.includes('[unknown]') ? 'create_task' : 'legacy_probe',
+      arguments: prompt.includes('[bad-args]') ? {} : { value: 'current' }, namespace: null });
+    text(JSON.stringify(result)); finish(); return;
+  }
+  if (prompt.includes('[metadata]')) {
+    const usage = (total, last) => notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { total: { totalTokens: total }, last: { totalTokens: last } } });
+    usage(1100, 100); usage(1100, 100); usage(1300, 200);
+    text('Metadata reported.'); finish(); return;
+  }
   if (prompt.includes('[split-secret]')) {
     const key = process.env.AGENTCRAFT_TEST_PROVIDER_KEY;
     const split = Math.floor(key.length / 2);
@@ -67,7 +85,7 @@ async function work() {
     const result = await client.callTool({ name: 'Bash', arguments: { command: 'node -e "console.log(Boolean(process.env.CODEX_API_KEY), Boolean(process.env.OPENAI_API_KEY), Boolean(process.env.AGENTCRAFT_MCP_TOKEN), Boolean(process.env.AGENTCRAFT_TEST_PROVIDER_KEY))"' } });
     if (!JSON.stringify(result).includes('false false false false')) throw new Error('provider credentials reached tool environment');
   } else if (prompt.includes('[lead]')) {
-    if (tools.some(t => ['Write', 'Edit', 'Bash'].includes(t.name))) throw new Error('lead has write tools');
+    if (tools.some(t => ['Write', 'Edit'].includes(t.name))) throw new Error('lead has write tools');
   } else {
     await client.callTool({ name: 'Write', arguments: { file_path: 'from-codex.txt', content: 'MCP write\n' } });
     if (prompt.includes('[limit]')) await client.callTool({ name: 'Write', arguments: { file_path: 'over-limit.txt', content: 'must not run' } });
@@ -80,13 +98,15 @@ async function work() {
 async function handle(message) {
   trace(message);
   const { id, method, params = {} } = message;
+  if (!method && pendingServerRequests.has(id)) { pendingServerRequests.get(id)(message.result ?? message.error); pendingServerRequests.delete(id); return; }
   const reply = result => emit({ id, result });
   switch (method) {
     case 'initialize':
       if (params.capabilities.experimentalApi) throw new Error('Experimental APIs must remain disabled');
       reply({ userAgent: 'fake-codex/0.160.0' }); break;
     case 'initialized': break;
-    case 'config/read': reply({ config: { model_providers: { test: { env_key: 'AGENTCRAFT_TEST_PROVIDER_KEY' } } } }); break;
+    case 'account/read': reply(process.env.AGENTCRAFT_TEST_NO_OPENAI_AUTH ? { account: null, requiresOpenaiAuth: false } : { account: { type: 'chatgpt', planType: 'plus' }, requiresOpenaiAuth: true }); break;
+    case 'config/read': reply({ config: { model: process.env.AGENTCRAFT_TEST_MODEL || 'gpt-configured', model_providers: { test: { env_key: 'AGENTCRAFT_TEST_PROVIDER_KEY' } } } }); break;
     case 'thread/start':
     case 'thread/resume': {
       if ('dynamicTools' in params) throw new Error('Dynamic tools must not be sent');
@@ -94,7 +114,7 @@ async function handle(message) {
       cwd = params.cwd; config = params.config; instructions = params.developerInstructions;
       const sandbox = params.sandbox === 'read-only' ? { type: 'readOnly', networkAccess: false }
         : { type: 'workspaceWrite', networkAccess: false, writableRoots: [cwd], excludeTmpdirEnvVar: true, excludeSlashTmp: true };
-      reply({ thread: { id: threadId }, cwd, approvalPolicy: params.approvalPolicy, sandbox });
+      reply({ model: params.model || process.env.AGENTCRAFT_TEST_MODEL || 'gpt-configured', thread: { id: threadId }, cwd, approvalPolicy: params.approvalPolicy, sandbox });
       break;
     }
     case 'turn/start':
